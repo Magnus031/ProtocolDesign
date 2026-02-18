@@ -1,0 +1,38 @@
+digraph "Graphical Class Hierarchy"
+{
+ // LATEX_PDF_SIZE
+  edge [fontname="Helvetica",fontsize="10",labelfontname="Helvetica",labelfontsize="10"];
+  node [fontname="Helvetica",fontsize="10",shape=record];
+  rankdir="LR";
+  Node0 [label="_I_GraPositionSymbolData\l_Utility",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class___i___gra_position_symbol_data___utility.html",tooltip=" "];
+  Node0 -> Node1 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node1 [label="GKC::GraPositionSymbolData",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_gra_position_symbol_data.html",tooltip=" "];
+  Node72 [label="_I_GraTokenSymbolData\l_Utility",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class___i___gra_token_symbol_data___utility.html",tooltip=" "];
+  Node72 -> Node73 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node73 [label="GKC::GraTokenSymbolData",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_gra_token_symbol_data.html",tooltip=" "];
+  Node115 [label="_I_RegexCharSetSymbolData\l_Utility",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class___i___regex_char_set_symbol_data___utility.html",tooltip=" "];
+  Node115 -> Node116 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node116 [label="GKC::RegexCharSetSymbolData",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_regex_char_set_symbol_data.html",tooltip=" "];
+  Node117 [label="_I_RegexCharSymbolData\l_Utility",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class___i___regex_char_symbol_data___utility.html",tooltip=" "];
+  Node117 -> Node118 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node118 [label="GKC::RegexCharSymbolData",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_regex_char_symbol_data.html",tooltip=" "];
+  Node119 [label="_I_RegexPositionSymbolData\l_Utility",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class___i___regex_position_symbol_data___utility.html",tooltip=" "];
+  Node119 -> Node120 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node120 [label="GKC::RegexPositionSymbolData",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_regex_position_symbol_data.html",tooltip=" "];
+  Node165 [label="_ICplMetaDataPositionSymbol\lDataUtility",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class___i_cpl_meta_data_position_symbol_data_utility.html",tooltip=" "];
+  Node165 -> Node166 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node166 [label="_CplMetaDataPositionSymbol\lDataBase",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class___cpl_meta_data_position_symbol_data_base.html",tooltip=" "];
+  Node166 -> Node167 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node167 [label="GKC::CplMetaDataPosition\lSymbolData",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_cpl_meta_data_position_symbol_data.html",tooltip=" "];
+  Node201 [label="_IGrammarSymbolData",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class___i_grammar_symbol_data.html",tooltip=" "];
+  Node201 -> Node202 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node202 [label="_GrammarSymbolDataBase",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class___grammar_symbol_data_base.html",tooltip=" "];
+  Node202 -> Node203 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node203 [label="GKC::BasicSymbolData",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_basic_symbol_data.html",tooltip=" "];
+  Node202 -> Node167 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node202 -> Node1 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node202 -> Node73 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node202 -> Node116 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node202 -> Node118 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node202 -> Node120 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+}

@@ -1,0 +1,25 @@
+var searchData=
+[
+  ['i_5fcreate_5fcallback_1888',['i_create_callback',['../struct__x__child__process_1_1i__create__callback.html',1,'_x_child_process']]],
+  ['i_5fmemory_5fallocator_5fref_5f32_1889',['i_memory_allocator_ref_32',['../classi__memory__allocator__ref__32.html',1,'']]],
+  ['i_5fmemory_5fallocator_5fref_5f32_5ffull_1890',['i_memory_allocator_ref_32_full',['../classi__memory__allocator__ref__32__full.html',1,'']]],
+  ['i_5fmemory_5fallocator_5fref_5f64_1891',['i_memory_allocator_ref_64',['../classi__memory__allocator__ref__64.html',1,'']]],
+  ['i_5fmemory_5fallocator_5fref_5f64_5ffull_1892',['i_memory_allocator_ref_64_full',['../classi__memory__allocator__ref__64__full.html',1,'']]],
+  ['i_5fmemory_5fmanager_1893',['i_memory_manager',['../classi__memory__manager.html',1,'']]],
+  ['i_5fui_5fhost_1894',['i_ui_host',['../classi__ui__host.html',1,'']]],
+  ['i_5fui_5fwindow_1895',['i_ui_window',['../classi__ui__window.html',1,'']]],
+  ['iguiapplication_1896',['IGuiApplication',['../class_g_k_c_1_1_i_gui_application.html',1,'GKC']]],
+  ['inireader_1897',['IniReader',['../class_g_k_c_1_1_ini_reader.html',1,'GKC']]],
+  ['iniwriter_1898',['IniWriter',['../class_g_k_c_1_1_ini_writer.html',1,'GKC']]],
+  ['inprocess_5fcondition_1899',['inprocess_condition',['../classinprocess__condition.html',1,'']]],
+  ['inprocess_5fmutex_1900',['inprocess_mutex',['../classinprocess__mutex.html',1,'']]],
+  ['inprocess_5frwlock_1901',['inprocess_rwlock',['../classinprocess__rwlock.html',1,'']]],
+  ['inprocess_5fsemaphore_1902',['inprocess_semaphore',['../classinprocess__semaphore.html',1,'']]],
+  ['interface_5fitem_1903',['interface_item',['../struct_g_k_c_1_1__lite__com__util_1_1interface__item.html',1,'GKC::_lite_com_util']]],
+  ['interprocess_5fmutex_1904',['interprocess_mutex',['../classinterprocess__mutex.html',1,'']]],
+  ['interprocess_5fsemaphore_1905',['interprocess_semaphore',['../classinterprocess__semaphore.html',1,'']]],
+  ['io_5fhandle_1906',['io_handle',['../classio__handle.html',1,'']]],
+  ['iteminfo_1907',['ItemInfo',['../struct_g_k_c_1_1___unit_test_map_1_1_item_info.html',1,'GKC::_UnitTestMap::ItemInfo'],['../struct_item_info.html',1,'ItemInfo']]],
+  ['iterator_1908',['Iterator',['../class_g_k_c_1_1___hash_table_1_1_iterator.html',1,'GKC::_HashTable&lt; TKey, TPair, THashTrait, TCompareTrait &gt;::Iterator'],['../class_g_k_c_1_1___r_b_tree_1_1_iterator.html',1,'GKC::_RBTree&lt; TKey, TPair, TCompareTrait &gt;::Iterator'],['../class_g_k_c_1_1_ast_tree_1_1_iterator.html',1,'GKC::AstTree::Iterator'],['../class_g_k_c_1_1_list_1_1_iterator.html',1,'GKC::List&lt; T, TCompareTrait &gt;::Iterator'],['../class_g_k_c_1_1_multiway_tree_1_1_iterator.html',1,'GKC::MultiwayTree&lt; T &gt;::Iterator'],['../class_g_k_c_1_1_single_list_1_1_iterator.html',1,'GKC::SingleList&lt; T, TCompareTrait &gt;::Iterator'],['../class_g_k_c_1_1_symbol_pool_1_1_iterator.html',1,'GKC::SymbolPool::Iterator']]],
+  ['iterator2_1909',['Iterator2',['../class_g_k_c_1_1___r_b_tree_1_1_iterator2.html',1,'GKC::_RBTree&lt; TKey, TPair, TCompareTrait &gt;::Iterator2'],['../class_g_k_c_1_1_list_1_1_iterator2.html',1,'GKC::List&lt; T, TCompareTrait &gt;::Iterator2']]]
+];

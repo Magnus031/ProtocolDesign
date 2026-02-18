@@ -1,0 +1,18 @@
+digraph "GKC::_TextStreamBase&lt; TByteStream &gt;"
+{
+ // LATEX_PDF_SIZE
+  edge [fontname="Helvetica",fontsize="10",labelfontname="Helvetica",labelfontsize="10"];
+  node [fontname="Helvetica",fontsize="10",shape=record];
+  Node1 [label="GKC::_TextStreamBase\l\< TByteStream \>",height=0.2,width=0.4,color="black", fillcolor="grey75", style="filled", fontcolor="black",tooltip=" "];
+  Node1 -> Node2 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node2 [label="GKC::_TextStreamRootBase\l\< _ByteStream \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1___text_stream_root_base.html",tooltip=" "];
+  Node2 -> Node3 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node3 [label="GKC::TextStream",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_text_stream.html",tooltip=" "];
+  Node2 -> Node4 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node4 [label="GKC::_ITextStreamRootImpl",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1___i_text_stream_root_impl.html",tooltip=" "];
+  Node4 -> Node3 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node4 -> Node5 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node5 [label="GKC::TextStreamU",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_text_stream_u.html",tooltip=" "];
+  Node1 -> Node6 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node6 [label="GKC::_TextStreamRootBase\l\< TByteStream \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1___text_stream_root_base.html",tooltip=" "];
+}

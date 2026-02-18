@@ -1,0 +1,32 @@
+digraph "Graphical Class Hierarchy"
+{
+ // LATEX_PDF_SIZE
+  edge [fontname="Helvetica",fontsize="10",labelfontname="Helvetica",labelfontsize="10"];
+  node [fontname="Helvetica",fontsize="10",shape=record];
+  rankdir="LR";
+  Node0 [label="plain_array\< T \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$classplain__array.html",tooltip="A class for plain array."];
+  Node0 -> Node1 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node1 [label="GKC::UniqueArray\< \l_file_item \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_unique_array.html",tooltip=" "];
+  Node0 -> Node2 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node2 [label="GKC::UniqueArray\< CharA \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_unique_array.html",tooltip=" "];
+  Node0 -> Node3 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node3 [label="GKC::UniqueArray\< GKC\l::_InstalledPackageItem \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_unique_array.html",tooltip=" "];
+  Node0 -> Node4 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node4 [label="GKC::UniqueArray\< GKC\l::Pair\< unique_string\l_t, unique_string_t \> \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_unique_array.html",tooltip=" "];
+  Node0 -> Node5 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node5 [label="GKC::UniqueArray\< unique\l_string_t \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_unique_array.html",tooltip=" "];
+  Node0 -> Node6 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node6 [label="GKC::UniqueArray\< mapClass\l::Position \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_unique_array.html",tooltip=" "];
+  Node0 -> Node7 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node7 [label="GKC::UniqueArray\< GKC\l::_PackageSignature \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_unique_array.html",tooltip=" "];
+  Node0 -> Node8 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node8 [label="unique_string_t\< Tchar2 \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$classunique__string__t.html",tooltip=" "];
+  Node0 -> Node9 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node9 [label="unique_string_t\< char_a \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$classunique__string__t.html",tooltip=" "];
+  Node0 -> Node10 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node10 [label="GKC::UniqueArray\< T \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_unique_array.html",tooltip=" "];
+  Node10 -> Node11 [dir="back",color="darkgreen",fontsize="10",style="solid",fontname="Helvetica"];
+  Node11 [label="GKC::EventArray\< callback\l_t\< GKC::PropertyNotification \> \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_event_array.html",tooltip=" "];
+  Node10 -> Node12 [dir="back",color="darkgreen",fontsize="10",style="solid",fontname="Helvetica"];
+  Node12 [label="GKC::EventArray\< T \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_event_array.html",tooltip="An array class using cookie mode."];
+}

@@ -1,0 +1,11 @@
+digraph "charset_converter_trait_U2H&lt; Tstring &gt;"
+{
+ // LATEX_PDF_SIZE
+  edge [fontname="Helvetica",fontsize="10",labelfontname="Helvetica",labelfontsize="10"];
+  node [fontname="Helvetica",fontsize="10",shape=record];
+  Node1 [label="charset_converter_trait\l_U2H\< Tstring \>",height=0.2,width=0.4,color="black", fillcolor="grey75", style="filled", fontcolor="black",tooltip=" "];
+  Node1 -> Node2 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node2 [label="charset_converter_trait\l_S2H\< Tstring \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$classcharset__converter__trait___s2_h.html",tooltip=" "];
+  Node1 -> Node3 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node3 [label="charset_converter_trait\l_U2S\< Tstring \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$classcharset__converter__trait___u2_s.html",tooltip=" "];
+}

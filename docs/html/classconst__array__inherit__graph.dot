@@ -1,0 +1,16 @@
+digraph "const_array&lt; T &gt;"
+{
+ // LATEX_PDF_SIZE
+  edge [fontname="Helvetica",fontsize="10",labelfontname="Helvetica",labelfontsize="10"];
+  node [fontname="Helvetica",fontsize="10",shape=record];
+  rankdir="LR";
+  Node1 [label="const_array\< T \>",height=0.2,width=0.4,color="black", fillcolor="grey75", style="filled", fontcolor="black",tooltip=" "];
+  Node2 -> Node1 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node2 [label="const_array_base\< T \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$structconst__array__base.html",tooltip=" "];
+  Node1 -> Node3 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node3 [label="const_string_t\< char_a \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$classconst__string__t.html",tooltip=" "];
+  Node1 -> Node4 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node4 [label="const_string_t\< char_s \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$classconst__string__t.html",tooltip=" "];
+  Node1 -> Node5 [dir="back",color="midnightblue",fontsize="10",style="solid",fontname="Helvetica"];
+  Node5 [label="const_string_t\< typename\l TCCTrait::Estring2::EType \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$classconst__string__t.html",tooltip=" "];
+}

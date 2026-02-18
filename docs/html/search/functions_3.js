@@ -1,0 +1,28 @@
+var searchData=
+[
+  ['calcnext_2211',['CalcNext',['../classcyclic__queue__utility.html#ac2e0d92e51e0385299d66ee028c2f0f9',1,'cyclic_queue_utility']]],
+  ['checkbom_2212',['CheckBOM',['../class_g_k_c_1_1___i_text_stream_root_impl.html#acb3fffb2a6fc78ad5fd76e3336a5cea7',1,'GKC::_ITextStreamRootImpl::CheckBOM()'],['../class___i_text_stream_root.html#a68944a1bc4039b9a710d35dfb037cc0b',1,'_ITextStreamRoot::CheckBOM()']]],
+  ['checkdirectoryexists_2213',['CheckDirectoryExists',['../class_g_k_c_1_1_file_management_helper.html#af2d19de5d63c3fa7014f3802e80dd9ef',1,'GKC::FileManagementHelper']]],
+  ['checkfileexists_2214',['CheckFileExists',['../class_g_k_c_1_1_file_management_helper.html#ab6ed159d032ef8cf30dc236dcc34ead6',1,'GKC::FileManagementHelper']]],
+  ['clear_2215',['Clear',['../classcyclic__queue__utility.html#a83ef883a1840bd3489385daa221d4cc2',1,'cyclic_queue_utility']]],
+  ['clear_5finfo_2216',['clear_info',['../class__w__child__process.html#a8141a8c6af9e37d0124850dceb30cad6',1,'_w_child_process']]],
+  ['close_2217',['Close',['../class_g_k_c_1_1_file_stream.html#a6a2e64def4693cb73018c4e93adea2d5',1,'GKC::FileStream::Close()'],['../class___i_file_utility.html#a491d621091594e2ad810da427427d7a1',1,'_IFileUtility::Close()'],['../class__w__async__socket.html#a4b07509a4c46400655321a30b6bee709',1,'_w_async_socket::Close()']]],
+  ['closepipestdin_2218',['ClosePipeStdin',['../class__w__rio__process.html#af881f4e6ccc093fdf47377d7de55400e',1,'_w_rio_process']]],
+  ['closepipestdout_2219',['ClosePipeStdout',['../class__w__rio__process.html#ae857d1f12a6b1bd00008631e1ea8eabd',1,'_w_rio_process']]],
+  ['closeprocesshandles_2220',['CloseProcessHandles',['../class__w__child__process.html#ad132b6a44b1d35bc28306abb0da401d4',1,'_w_child_process']]],
+  ['comparedeleteddate_2221',['CompareDeletedDate',['../class_g_k_c_1_1_date_helper.html#a99420c3a0b76297fb66d5f11a4ebd35e',1,'GKC::DateHelper']]],
+  ['complex_2222',['Complex',['../class_g_k_c_1_1_complex.html#ae056bb45d05609754c292889f9bb02e5',1,'GKC::Complex::Complex() noexcept'],['../class_g_k_c_1_1_complex.html#a9fb7b4966433852207f5d3e1bd1a1fa2',1,'GKC::Complex::Complex(const T &amp;r, const T &amp;i) noexcept'],['../class_g_k_c_1_1_complex.html#abc5ea7f77ae883c5113534780f735524',1,'GKC::Complex::Complex(const Complex&lt; T &gt; &amp;src) noexcept']]],
+  ['conj_2223',['Conj',['../class_g_k_c_1_1_complex.html#a8eb0aceb6f08a9823238959d6d44716e',1,'GKC::Complex']]],
+  ['connect_2224',['Connect',['../class__w__async__socket.html#a2f6c7b6edd13cbccba942cfcfcda50f1',1,'_w_async_socket']]],
+  ['copy_2225',['Copy',['../class_stream_helper.html#a8ffab0a97aa6ada80c7e936ba659a9a5',1,'StreamHelper']]],
+  ['cos_2226',['Cos',['../classfloat__helper.html#a820fc91a45a2379a25ee6481317d1bbb',1,'float_helper']]],
+  ['cosh_2227',['Cosh',['../classfloat__helper.html#a1d9157f2682709d08e5c4be0ad67605e',1,'float_helper']]],
+  ['crc32calc_2228',['CRC32Calc',['../class_g_k_c_1_1_c_r_c32_calc.html#a5aa48031ea23b91852f8b199cd8c7e10',1,'GKC::CRC32Calc']]],
+  ['create_2229',['Create',['../class___i_multi_file_utility.html#ae6d92c96f7ad79963317dc749faf67f6',1,'_IMultiFileUtility::Create()'],['../class__w__async__socket.html#a91b7ca07091b69602bf0666f469e000e',1,'_w_async_socket::Create()'],['../class_g_k_c_1_1_multi_file_stream.html#a67cc8507f8170510e7aa61e0a720db1d',1,'GKC::MultiFileStream::Create()'],['../class__w__rio__process.html#adf4e0e072b697dc952936c12b8334d69',1,'_w_rio_process::Create()'],['../class__w__child__process.html#a7d37f4622e9629c1a20dca9fade9c6c5',1,'_w_child_process::Create()']]],
+  ['createbufferstream_2230',['CreateBufferStream',['../class_stream_helper.html#aad7f4deb5385d229e464ceca88caf388',1,'StreamHelper']]],
+  ['createdirectory_2231',['CreateDirectory',['../class_g_k_c_1_1_file_management_helper.html#ad3d211ee36da67b66e0ed899e07bd8b1',1,'GKC::FileManagementHelper::CreateDirectory(const ConstStringT&lt; Tchar &gt; &amp;str)'],['../class_g_k_c_1_1_file_management_helper.html#ad36f2bbdbb6f180452921d251e42edc3',1,'GKC::FileManagementHelper::CreateDirectory(const ConstStringT&lt; Tchar &gt; &amp;str, bool &amp;bExisting)']]],
+  ['createfilestream_2232',['CreateFileStream',['../class_stream_helper.html#a217ee4e5559825e820e049ea8fee33e8',1,'StreamHelper']]],
+  ['creatememorystream_2233',['CreateMemoryStream',['../class_stream_helper.html#a58e6ad52c869d7f01fe63473af2b05fa',1,'StreamHelper']]],
+  ['createtextstream_2234',['CreateTextStream',['../class_stream_helper.html#a74e30b26587cb63af00e200c1fa44271',1,'StreamHelper']]],
+  ['cyclic_5fqueue_5futility_2235',['cyclic_queue_utility',['../classcyclic__queue__utility.html#a7d74aa484d4edcb2ac480df7b0f33a29',1,'cyclic_queue_utility']]]
+];

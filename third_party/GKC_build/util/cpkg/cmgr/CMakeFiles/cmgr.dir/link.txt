@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/cmgr.dir/src/Main.cpp.o CMakeFiles/cmgr.dir/src/Global.cpp.o CMakeFiles/cmgr.dir/src/base/MgrDef.cpp.o CMakeFiles/cmgr.dir/src/base/MgrBase.cpp.o CMakeFiles/cmgr.dir/src/single/SingleProcess.cpp.o -o ../../../bin/cmgr  -Wl,-rpath,/home/magnus/ProtocolDesign/third_party/GKC_build/bin: ../../../bin/libGkcSys.so.1.0 -ldl -lpthread -lrt 

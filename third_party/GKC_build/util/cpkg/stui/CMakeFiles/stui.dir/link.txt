@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/stui.dir/src/Main.cpp.o -o ../../../bin/stui  -ldl -lpthread -lrt 

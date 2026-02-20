@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/detcpl.dir/src/Main.cpp.o CMakeFiles/detcpl.dir/src/Global.cpp.o -o ../../bin/detcpl  -ldl -lpthread -lrt 

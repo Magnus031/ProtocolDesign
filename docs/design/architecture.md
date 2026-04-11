@@ -1,4 +1,4 @@
-# ProtocolDesign — 基于 UDP 的自定义可靠传输协议
+# ProtocolDesign — 服务器绘制界面程序的客户端通信协议
 
 ## 目录
 
@@ -6,9 +6,9 @@
 2. [系统架构](#2-系统架构)
 3. [目录结构](#3-目录结构)
 4. [协议设计](#4-协议设计)
-5. [核心数据结构](#5-核心数据结构)
+5. [核心接口与数据结构](#5-核心接口与数据结构)
 6. [各模块详解](#6-各模块详解)
-7. [关键算法](#7-关键算法)
+7. [关键算法与机制](#7-关键算法与机制)
 8. [配置参数](#8-配置参数)
 9. [编译与运行](#9-编译与运行)
 10. [设计亮点与已知局限](#10-设计亮点与已知局限)
@@ -17,58 +17,103 @@
 
 ## 1. 项目简介
 
-本项目是一个用 **C++17** 编写的、基于 **UDP** 的自定义通信协议演示系统。
+本项目是一个用 **C++17** 编写的、基于 **TCP** 的应用级 UI 虚拟化通信协议实现系统。
+
+### 核心理念
+
+"**计算上云、交互下沉**"——将计算密集型的业务逻辑与图形渲染交由服务端完成，客户端仅负责像素重构与输入事件采集，实现轻量化的远程应用交互。
 
 ### 它能做什么？
 
-- **图像传输**：服务端将本地图片拆包后通过 UDP 发送给客户端，客户端收齐后重组并保存。
-- **输入事件流**：客户端将鼠标/键盘事件实时发送给服务端。
-- **可靠性保障**：在不可靠的 UDP 之上，通过 ACK 确认 + 超时重传 + 主动请求补包，实现类似 TCP 的可靠传输。
-- **网关路由**：所有流量经过一个中间网关转发，客户端和服务端不直接通信。
+- **应用级 UI 虚拟化**：以独立应用（而非整个桌面）为粒度，实现远程界面的实时传输与交互，区别于 RDP/VNC 的桌面镜像模式。
+- **像素矩阵差分传输**：AppHost 在服务端本地完成渲染，通过脏矩形差分检测仅传输变化区域的像素数据，大幅降低带宽消耗。
+- **输入事件实时同步**：客户端捕获鼠标/键盘事件，标准化封装后通过网关精准路由至对应的后端 AppHost 进程。
+- **智能网关调度**：网关支持多客户端并发接入、动态路由、AppHost 进程的生命周期管理，天然支持水平扩展。
+- **业务逻辑解耦**：通过 IUiHost 接口抽象，使业务代码（.so/.dll 插件）无需感知网络存在，可在本地渲染与远程传输模式间自由切换。
 
 ### 适用场景
 
-- 学习自定义网络协议设计
-- 理解 UDP 可靠化改造思路
-- 远程桌面/屏幕共享原型
+- 云原生应用的轻量化部署与交付
+- 远程桌面 / 云游戏 / 工业数字孪生的应用级虚拟化
+- 跨平台协作工具
+- 学习自定义网络协议设计与应用级虚拟化架构
 
 ---
 
 ## 2. 系统架构
 
-### 拓扑结构
+### 2.1 整体拓扑
+
+系统采用 **Client → Gateway → AppHost** 三层架构，所有通信均通过智能网关中转：
 
 ```
-┌──────────────┐          ┌──────────────┐          ┌──────────────┐
-│   Client     │◄────────►│   Gateway    │◄────────►│  ServerApp   │
-│  127.0.0.1   │   UDP    │  127.0.0.1   │   UDP    │  127.0.0.1   │
-│  Port 9001   │          │  Port 9000   │          │  Port 9002   │
-└──────────────┘          └──────────────┘          └──────────────┘
+┌──────────────────┐                ┌──────────────────┐                ┌──────────────────┐
+│     Client       │    TCP 长连接   │     Gateway      │    TCP 长连接   │    AppHost(s)    │
+│   (FLTK 客户端)  │◄──────────────►│   (智能网关)      │◄──────────────►│  (应用宿主进程)   │
+│                  │                │                  │                │                  │
+│ · 像素重构(BitBlt)│   单端口接入    │ · Session 管理    │   动态路由      │ · 加载业务 .so    │
+│ · 输入事件采集    │                │ · 动态路由转发     │                │ · 本地渲染        │
+│ · 窗口管理       │                │ · 进程生命周期     │                │ · 脏矩形检测      │
+│                  │                │ · epoll 多路复用   │                │ · 像素差分发送     │
+└──────────────────┘                └──────────────────┘                └──────────────────┘
 ```
 
-### 数据流向
+### 2.2 数据流向
 
-| 方向 | 内容 |
-|------|------|
-| Client → Gateway → ServerApp | 鼠标/键盘事件、ACK 确认、补包请求 |
-| ServerApp → Gateway → Client | 图像数据包 |
+| 方向 | 内容 | 说明 |
+|------|------|------|
+| Client → Gateway → AppHost | 鼠标/键盘事件、窗口控制指令 | 输入事件实时透传 |
+| AppHost → Gateway → Client | 脏矩形像素数据、窗口状态更新 | 仅传输变化区域 |
+| Client → Gateway | SPAWN_APP 请求、心跳包 | 会话建立与维护 |
+| Gateway → Client | Session ID 分配、错误通知 | 会话管理响应 |
+| Gateway ↔ AppHost | 进程拉起/回收、健康检查 | 生命周期管理 |
 
-### 线程模型
+### 2.3 会话模型
 
-**Client 端：**
 ```
-主线程          ──► 接收 UDP 包，处理图像数据
-维护线程        ──► 监控传输进度，请求缺失包
-（输入模拟线程）──► 生成随机输入事件（当前已禁用）
+                    ┌─────────────────────────────────┐
+                    │           Gateway               │
+  Client_1 ────────►│                                 │────────► AppHost_A (app1.so)
+  (Session 0x01)    │   Session 路由表                 │
+                    │   ┌───────────────────────────┐ │
+  Client_2 ────────►│   │ Client_Socket ↔ Session_ID│ │────────► AppHost_B (app2.so)
+  (Session 0x02)    │   │ Session_ID ↔ AppHost_Socket│ │
+                    │   └───────────────────────────┘ │
+  Client_3 ────────►│                                 │────────► AppHost_C (app1.so)
+  (Session 0x03)    │                                 │
+                    └─────────────────────────────────┘
 ```
 
-**ServerApp 端：**
+- 每个 Client 连接分配唯一 Session ID
+- Gateway 维护 `Client_Socket ↔ Session_ID ↔ AppHost_Socket` 双向映射表
+- 支持多客户端并发接入同一端口
+- AppHost 进程按需动态拉起，支持水平扩展
+
+### 2.4 线程 / 并发模型
+
+**Gateway（智能网关）：**
 ```
-主线程          ──► 接收 UDP 包，分发到队列
-事件处理线程    ──► 消费输入事件队列，记录日志
-图像发送线程    ──► 顺序发送图像包
-传输监控线程    ──► 检测超时，触发重传
-目录扫描线程    ──► 每 60 秒重新扫描图像目录
+主线程 (epoll/select)  ──► 监听客户端连接、I/O 多路复用
+路由分发               ──► 解析 Session ID，精准路由数据包
+进程管理               ──► fork/exec 拉起 AppHost，回收孤儿进程
+心跳监测               ──► 检测客户端/AppHost 存活状态
+```
+
+**AppHost（应用宿主）：**
+```
+主线程                 ──► 加载业务 .so 插件 (dlopen/dlsym)
+渲染线程               ──► 执行业务逻辑，写入像素缓冲区
+差分检测线程           ──► 逐帧对比，定位脏矩形区域
+数据发送线程           ──► 压缩像素数据，封包发往 Gateway
+事件接收线程           ──► 接收并分发客户端输入事件
+```
+
+**Client（客户端）：**
+```
+主事件循环 (FLTK)      ──► 接收像素数据包，BitBlt 贴图重构界面
+输入采集               ──► 捕获鼠标/键盘 Raw Input 事件
+网络接收线程           ──► 从 Gateway 接收数据，解包分发
+心跳发送               ──► 定期发送心跳维持会话
 ```
 
 ---
@@ -76,159 +121,345 @@
 ## 3. 目录结构
 
 ```
-protocoldesign_/
-├── Protocol.h          # 协议消息类型、头部结构、序列化/反序列化接口
-├── Protocol.cpp        # 协议序列化/反序列化实现
-├── UDPSocket.h         # 跨平台 UDP Socket 封装接口
-├── UDPSocket.cpp       # UDP Socket 实现（支持 Windows/Linux）
-├── ImageHandler.h      # 图像文件读写、拆包/合包接口
-├── ImageHandler.cpp    # 图像处理实现
-├── Gateway.cpp         # 网关：消息路由转发（独立可执行程序）
-├── Client.cpp          # 客户端：接收图像、发送输入事件（独立可执行程序）
-└── ServerApp.cpp       # 服务端：发送图像、接收输入事件（独立可执行程序）
+ProtocolDesign/
+├── .bazelversion              # Bazel 版本 (7.4.1)
+├── MODULE.bazel               # Bazel 模块配置
+├── WORKSPACE                  # Bazel 工作区配置
+├── README.md                  # 项目说明
+│
+├── docs/                      # 文档目录
+│   ├── Doxyfile               # Doxygen 配置
+│   ├── api/
+│   │   └── API_reference.md   # API 参考文档
+│   ├── design/
+│   │   ├── architecture.md    # 架构设计文档（本文件）
+│   │   └── protocol_spec.md   # 协议规范文档
+│   └── html/                  # Doxygen 生成的文档
+│
+├── src/                       # 源代码目录
+│   ├── protocol/              # 协议层：消息定义与序列化
+│   │   ├── protocol.h         # 消息类型枚举、协议头结构体
+│   │   ├── protocol.cpp       # 序列化/反序列化实现
+│   │   ├── message_parser.h   # TCP 粘包/半包状态机解析器
+│   │   ├── message_parser.cpp
+│   │   └── BUILD
+│   │
+│   ├── network/               # 网络传输层
+│   │   ├── socket.h           # Socket 抽象接口
+│   │   ├── tcp_socket.h       # TCP Socket 封装声明
+│   │   ├── tcp_socket_linux.cpp   # Linux POSIX Socket 实现
+│   │   ├── tcp_socket_win.cpp     # Windows Winsock2 实现
+│   │   ├── event_loop.h       # I/O 多路复用抽象接口
+│   │   ├── epoll_event_loop.cpp   # Linux epoll 实现
+│   │   ├── select_event_loop.cpp  # 通用 select 实现（Windows/跨平台）
+│   │   └── BUILD
+│   │
+│   ├── gateway/               # 智能网关（可执行程序）
+│   │   ├── gateway.h          # 网关核心类声明
+│   │   ├── gateway.cpp        # 网关核心逻辑
+│   │   ├── session_manager.h  # Session 管理（路由表维护）
+│   │   ├── session_manager.cpp
+│   │   ├── process_manager.h  # AppHost 进程生命周期管理
+│   │   ├── process_manager.cpp
+│   │   ├── main.cpp           # 入口
+│   │   └── BUILD
+│   │
+│   ├── apphost/               # 应用宿主（可执行程序，由 Gateway 动态拉起）
+│   │   ├── apphost.h          # AppHost 核心类声明
+│   │   ├── apphost.cpp        # AppHost 核心逻辑
+│   │   ├── ui_host_impl.h     # IUiHost 接口的远程模式实现
+│   │   ├── ui_host_impl.cpp
+│   │   ├── pixel_buffer.h     # 像素缓冲区管理
+│   │   ├── pixel_buffer.cpp
+│   │   ├── dirty_rect_detector.h   # 脏矩形差分检测
+│   │   ├── dirty_rect_detector.cpp
+│   │   ├── plugin_loader.h    # .so/.dll 插件动态加载
+│   │   ├── plugin_loader.cpp
+│   │   ├── main.cpp           # 入口
+│   │   └── BUILD
+│   │
+│   ├── client/                # 客户端（可执行程序）
+│   │   ├── client.h           # 客户端核心类声明
+│   │   ├── client.cpp         # 客户端核心逻辑
+│   │   ├── window.h           # FLTK 窗口管理
+│   │   ├── window.cpp
+│   │   ├── input_handler.h    # 鼠标/键盘输入采集
+│   │   ├── input_handler.cpp
+│   │   ├── pixel_renderer.h   # 像素重构（BitBlt 贴图）
+│   │   ├── pixel_renderer.cpp
+│   │   ├── main.cpp           # 入口
+│   │   └── BUILD
+│   │
+│   └── common/                # 公共工具库
+│       ├── types.h            # 通用类型定义（ui_rect, ui_point, ColorQuad）
+│       ├── byte_order.h       # 大端序/主机字节序转换工具
+│       ├── logger.h           # 日志接口
+│       ├── logger.cpp         # 日志实现
+│       └── BUILD
+│
+├── tests/                     # 测试目录
+│   └── BUILD
+│
+└── third_party/               # 第三方依赖
+    ├── BUILD
+    ├── GKC/                   # GKC (General Kind C++) 框架
+    │   ├── public/include/
+    │   │   ├── base/          # 基础框架 (GkcDef.h, GkcFrame.h)
+    │   │   ├── sys/           # 系统工具 (GkcSys.h: 文件、流、线程)
+    │   │   └── ui/            # UI 框架 (IUiHost, IUiWindow 接口定义)
+    │   │       └── system/
+    │   │           ├── host_types.h   # i_ui_host, i_ui_window 接口
+    │   │           └── basic_types.h  # ui_rect, ui_point, ColorQuad 等类型
+    │   └── ...
+    └── GKC_BUILD/             # GKC 预编译产物
+        └── release/bin/Release/
+            ├── GkcSys.dll     # Windows 动态库
+            └── GkcSys.lib     # Windows 导入库
 ```
 
-> 三个 `.cpp` 文件（Gateway、Client、ServerApp）各自包含 `main()` 函数，分别编译为三个独立的可执行程序。
+> **构建系统**：Bazel 7.4.1，通过 `rules_foreign_cc` 集成 GKC 框架的 CMake 构建。
+> 三个可执行目标：Gateway、AppHost、Client 分别独立编译。
 
 ---
 
 ## 4. 协议设计
 
-### 4.1 消息类型
+### 4.1 设计原则
+
+本协议基于 **纯 TCP 长连接**，采用自定义二进制格式，设计目标：
+- 通过固定长度 Header 解决 TCP 流式传输的**粘包**与**半包**问题
+- 通过 Magic Number 过滤非法数据包
+- 通过 Session ID 支持多应用会话复用
+- 保证指令解析的原子性
+
+### 4.2 协议头（Header）格式
+
+所有消息均以一个 **固定长度 Header** 开头，后跟可变长度载荷（Body）：
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Bytes 0-3     │  Bytes 4-7     │  Byte 8       │  Bytes 9-12      │
+│  Magic Number  │  Session ID    │  Cmd Type     │  Body Length      │
+│  (4 bytes)     │  (4 bytes BE)  │  (1 byte)     │  (4 bytes BE)    │
+└──────────────────────────────────────────────────────────────────────┘
+│  Body (bodyLength bytes)                                            │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+| 字段 | 大小 | 说明 |
+|------|------|------|
+| **Magic Number** | 4 bytes | 固定标识，用于非法包过滤与协议版本识别 |
+| **Session ID** | 4 bytes (BE) | 会话标识，用于 Gateway 多应用路由映射 |
+| **Cmd Type** | 1 byte | 指令类型枚举 |
+| **Body Length** | 4 bytes (BE) | 后续载荷的字节长度 |
+
+> **BE = Big-Endian（大端序/网络字节序）**，所有多字节整数均使用大端序。
+
+### 4.3 指令类型（Cmd Type）
 
 ```cpp
-enum class MessageType : uint8_t {
-    MOUSE_EVENTS    = 0x01,  // 鼠标事件
-    KEYBOARD_EVENT  = 0x02,  // 键盘事件
-    IMAGE_DATA      = 0x03,  // 图像数据包
-    ACK             = 0x04,  // 确认应答
-    RETRANSMIT_REQ  = 0x05,  // 补包请求
+enum class CmdType : uint8_t {
+    // 会话管理
+    SPAWN_APP       = 0x01,  // 请求拉起 AppHost 进程
+    SESSION_ACK     = 0x02,  // 会话建立确认，返回 Session ID
+    HEARTBEAT       = 0x03,  // 心跳包
+
+    // 输入事件
+    MOUSE_EVENT     = 0x10,  // 鼠标事件（移动、点击、滚轮）
+    KEYBOARD_EVENT  = 0x11,  // 键盘事件（按下/释放）
+
+    // 像素传输
+    DIRTY_RECT      = 0x20,  // 脏矩形像素数据
+    FRAME_ACK       = 0x21,  // 帧确认（客户端已完成重绘）
+    WINDOW_STATE    = 0x22,  // 窗口状态更新（尺寸、位置）
+
+    // 控制指令
+    APP_EXIT        = 0xF0,  // 应用退出通知
     ERROR           = 0xFF   // 错误消息
 };
 ```
 
-### 4.2 通用消息格式
+### 4.4 各类型载荷格式
 
-所有消息均以一个 **9 字节固定头部** 开头，后跟可变长度载荷：
-
+**SPAWN_APP 请求载荷：**
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Byte 0   │  Bytes 1-4    │  Bytes 5-8                  │
-│  type     │  messageId    │  dataLength                 │
-│  (1 byte) │  (4 bytes BE) │  (4 bytes BE)               │
-└─────────────────────────────────────────────────────────┘
-│  Payload (dataLength bytes)                             │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────┬──────────────────────┐
+│ appNameLength    │ appName              │
+│ (4 bytes BE)     │ (variable, UTF-8)    │
+└──────────────────┴──────────────────────┘
 ```
 
-> **BE = Big-Endian（大端序/网络字节序）**，所有多字节整数均使用大端序。
-
-### 4.3 各类型载荷格式
-
-**鼠标事件（MOUSE_EVENTS）载荷，9 字节：**
+**鼠标事件（MOUSE_EVENT）载荷：**
 ```
-┌──────────────┬──────────────────┬──────────────────┐
-│ eventType    │ x                │ y                │
-│ (1 byte)     │ (4 bytes BE)     │ (4 bytes BE)     │
-└──────────────┴──────────────────┴──────────────────┘
+┌──────────────┬──────────────────┬──────────────────┬──────────────────┐
+│ eventType    │ x                │ y                │ timestamp        │
+│ (1 byte)     │ (4 bytes BE)     │ (4 bytes BE)     │ (8 bytes BE)     │
+└──────────────┴──────────────────┴──────────────────┴──────────────────┘
 ```
 
-鼠标事件类型：`MOVE=0x01`、`LEFT_CLICK=0x02`、`RIGHT_CLICK=0x03`、`SCROLL=0x04`
+鼠标事件类型：`MOVE=0x01`、`LEFT_DOWN=0x02`、`LEFT_UP=0x03`、`RIGHT_DOWN=0x04`、`RIGHT_UP=0x05`、`SCROLL=0x06`
 
-**键盘事件（KEYBOARD_EVENT）载荷，3 字节：**
+**键盘事件（KEYBOARD_EVENT）载荷：**
 ```
-┌──────────────────┬──────────────┐
-│ keyCode          │ isPressed    │
-│ (2 bytes BE)     │ (1 byte)     │
-└──────────────────┴──────────────┘
-```
-
-**图像数据（IMAGE_DATA）载荷，格式如下：**
-```
-┌────────────┬──────────────┬─────────────┬────────────────┬──────────────┬──────────┐
-│ imageId    │ totalPackets │ packetIndex │ filenameLength │ filename     │ data     │
-│ (4 bytes)  │ (4 bytes)    │ (4 bytes)   │ (4 bytes)      │ (variable)   │(variable)│
-└────────────┴──────────────┴─────────────┴────────────────┴──────────────┴──────────┘
+┌──────────────────┬──────────────┬──────────────────┐
+│ keyCode          │ isPressed    │ timestamp        │
+│ (2 bytes BE)     │ (1 byte)     │ (8 bytes BE)     │
+└──────────────────┴──────────────┴──────────────────┘
 ```
 
-**ACK / 补包请求（ACK / RETRANSMIT_REQ）载荷，8 字节：**
+**脏矩形像素数据（DIRTY_RECT）载荷：**
 ```
-┌────────────┬──────────────┐
-│ imageId    │ packetIndex  │
-│ (4 bytes)  │ (4 bytes)    │
-└────────────┴──────────────┘
+┌────────────┬────────────┬────────────┬────────────┬──────────┬──────────┬──────────┐
+│ frameSeq   │ rectX      │ rectY      │ rectW      │ rectH    │ dataLen  │ pixelData│
+│ (4 bytes)  │ (4 bytes)  │ (4 bytes)  │ (4 bytes)  │ (4 bytes)│ (4 bytes)│(variable)│
+└────────────┴────────────┴────────────┴────────────┴──────────┴──────────┴──────────┘
 ```
 
-### 4.4 可靠性机制
+- `frameSeq`：帧序列号，客户端可据此在丢包环境下执行有选择的脏矩形丢弃
+- `rectX/Y/W/H`：脏矩形在窗口中的坐标与尺寸
+- `pixelData`：该区域的 ARGB 像素矩阵数据（可压缩）
 
-UDP 本身不保证可靠性，本协议通过以下机制弥补：
+**窗口状态（WINDOW_STATE）载荷：**
+```
+┌──────────────┬──────────────┬──────────────┬──────────────┐
+│ windowWidth  │ windowHeight │ posX         │ posY         │
+│ (4 bytes)    │ (4 bytes)    │ (4 bytes)    │ (4 bytes)    │
+└──────────────┴──────────────┴──────────────┴──────────────┘
+```
 
-| 机制 | 说明 |
-|------|------|
-| **ACK 确认** | 客户端每收到一个图像包，立即回复 ACK |
-| **超时重传** | 服务端若 2 秒内未收到某包的 ACK，主动重发 |
-| **主动补包** | 客户端维护线程发现缺包时，主动发送 RETRANSMIT_REQ |
-| **自适应频率** | 补包请求频率随传输进度动态加快（见下节） |
-| **总超时保护** | 单次图像传输超过 5 分钟则放弃 |
+### 4.5 TCP 粘包/半包处理
+
+由于 TCP 是流式协议，接收端采用**状态机**模式解包：
+
+```
+                ┌──────────┐
+                │  IDLE    │
+                └────┬─────┘
+                     │ 接收数据
+                     ▼
+           ┌────────────────────┐
+           │  READ_HEADER       │ ◄── 累积读满 Header 长度
+           │  (缓冲区累积)       │
+           └────────┬───────────┘
+                    │ Header 完整
+                    ▼
+         ┌──────────────────────┐
+         │ VALIDATE_MAGIC       │ ◄── 校验 Magic Number
+         │                      │     失败则丢弃并重新同步
+         └────────┬─────────────┘
+                  │ 校验通过
+                  ▼
+         ┌──────────────────────┐
+         │  READ_BODY           │ ◄── 根据 Body Length 继续累积
+         │  (缓冲区累积)         │
+         └────────┬─────────────┘
+                  │ Body 完整
+                  ▼
+         ┌──────────────────────┐
+         │  DISPATCH            │ ◄── 按 Cmd Type 分发处理
+         └──────────────────────┘
+```
 
 ---
 
-## 5. 核心数据结构
+## 5. 核心接口与数据结构
 
-### Protocol.h 中的结构体
+### 5.1 IUiHost 接口（来自 GKC 框架）
+
+IUiHost 是系统的核心抽象接口，实现业务逻辑对底层图形库的透明化：
 
 ```cpp
-// 消息头（9字节，内存对齐关闭）
-struct MessageHeader {
-    MessageType type;      // 1 byte
-    uint32_t    messageId; // 4 bytes，大端序
-    uint32_t    dataLength;// 4 bytes，大端序
+// GKC::i_ui_host — 窗口宿主抽象接口
+class i_ui_host {
+public:
+    virtual int  Loop()                  noexcept = 0;  // 主事件循环
+    virtual void Quit()                  noexcept = 0;  // 退出事件循环
+    virtual i_ui_window* Create(int iType) noexcept = 0;  // 创建窗口
+    virtual void Destroy(i_ui_window* p) noexcept = 0;  // 销毁窗口
 };
 
-// 图像数据包
-struct ImageData {
-    uint32_t              imageId;
-    uint32_t              totalPackets;   // 该图像总包数
-    uint32_t              packetIndex;    // 当前包序号（从 0 开始）
-    uint32_t              filenameLength;
-    std::string           filename;
-    std::vector<uint8_t>  data;           // 本包的图像字节
+// GKC::i_ui_window — 窗口接口
+class i_ui_window {
+public:
+    virtual void GetInfo(ui_window_info& info) noexcept = 0;
 };
 
-// ACK / 补包请求
-struct AckData {
-    uint32_t imageId;
-    uint32_t packetIndex;
+// 窗口类型
+enum {
+    UW_TYPE_TOPLEVEL = 0,  // 顶层窗口
+    UW_TYPE_DIALOG,        // 对话框
+    UW_TYPE_POPUP          // 弹出窗口
 };
 ```
 
-### Client.cpp 中的接收状态
+**接口透明化原理**：业务逻辑（.so/.dll 插件）仅调用 IUiHost 接口进行绑定、渲染相关的操作。当运行在本地模式时，IUiHost 直接驱动本地图形库（如 GTK/Win32）；当运行在远程模式时，AppHost 实现的 IUiHost 将渲染结果写入内存像素缓冲区，再通过协议传输至客户端。业务代码无需任何修改。
+
+### 5.2 IGuiApplication 接口
 
 ```cpp
-struct ImageReceiveState {
-    uint32_t imageId;
-    uint32_t totalPackets;
-    std::string filename;
-    std::map<uint32_t, std::vector<uint8_t>> packets;      // 已收到的包
-    std::set<uint32_t> receivedPackets;                    // 已收到的包序号
-    std::set<uint32_t> acknowledgedPackets;                // 已 ACK 的包序号
-    std::chrono::steady_clock::time_point lastUpdate;      // 最后更新时间
+// 业务应用接口
+class IGuiApplication {
+public:
+    virtual bool Initialize(IUiHost* pHost) noexcept = 0;  // 初始化，注入 IUiHost
+    virtual int  Run()                      noexcept = 0;  // 运行业务逻辑
+    virtual void Cleanup()                  noexcept = 0;  // 清理资源
 };
 ```
 
-### ServerApp.cpp 中的发送状态
+### 5.3 UI 基础类型
 
 ```cpp
-struct ImageSendState {
-    uint32_t imageId;
-    std::string imagePath;
-    std::string filename;
-    std::vector<std::vector<uint8_t>> packets;             // 所有分包数据
-    std::set<uint32_t> sentPackets;                        // 已发送的包
-    std::set<uint32_t> acknowledgedPackets;                // 已确认的包
-    std::map<uint32_t, time_point> lastSentTime;           // 每包最后发送时间
-    std::chrono::steady_clock::time_point startTime;
-    bool completed;
+// 脏矩形描述
+struct ui_rect {
+    int left, top, right, bottom;
+    // 支持 inflate/deflate/intersect/union 等几何操作
+};
+
+// 坐标点
+struct ui_point {
+    int x, y;
+};
+
+// ARGB 颜色
+using ColorQuad = uint32_t;  // 0xAARRGGBB
+```
+
+### 5.4 协议头结构
+
+```cpp
+#pragma pack(push, 1)
+struct ProtocolHeader {
+    uint32_t  magicNumber;    // 固定标识，过滤非法包
+    uint32_t  sessionId;      // 会话 ID（大端序）
+    uint8_t   cmdType;        // 指令类型 (CmdType 枚举)
+    uint32_t  bodyLength;     // 载荷长度（大端序）
+};
+#pragma pack(pop)
+```
+
+### 5.5 脏矩形数据
+
+```cpp
+struct DirtyRectData {
+    uint32_t              frameSeq;      // 帧序列号
+    ui_rect               rect;          // 脏矩形区域
+    std::vector<uint8_t>  pixelData;     // ARGB 像素数据（可压缩）
+};
+```
+
+### 5.6 输入事件
+
+```cpp
+struct MouseEvent {
+    uint8_t   eventType;    // MOVE/LEFT_DOWN/LEFT_UP/RIGHT_DOWN/RIGHT_UP/SCROLL
+    int32_t   x, y;         // 坐标
+    uint64_t  timestamp;    // 时间戳（微秒）
+};
+
+struct KeyboardEvent {
+    uint16_t  keyCode;      // 按键码
+    uint8_t   isPressed;    // 1=按下, 0=释放
+    uint64_t  timestamp;    // 时间戳（微秒）
 };
 ```
 
@@ -236,185 +467,224 @@ struct ImageSendState {
 
 ## 6. 各模块详解
 
-### 6.1 Gateway（网关）
+### 6.1 Gateway（智能网关）
 
-**文件：** [Gateway.cpp](Gateway.cpp)
+**目录**：`src/gateway/`
 
-最简单的一个组件，只做一件事：**根据发送方端口决定转发目标**。
+Gateway 是系统的中枢节点，职责远超简单转发，具备以下核心能力：
+
+#### I/O 多路复用
+
+- Linux 环境下采用 `epoll` 实现高并发连接监听
+- 非阻塞 I/O 配合线程池的 Reactor 模式
+- 单端口对多客户端连接的实时监听与数据分发
+
+#### 动态路由与 Session 管理
 
 ```
-收到来自 9001（Client）的包  →  转发到 9002（ServerApp）
-收到来自 9002（ServerApp）的包 →  转发到 9001（Client）
+1. Client 连接 Gateway
+2. Client 发送 SPAWN_APP 指令（携带应用名）
+3. Gateway 通过 fork/exec 拉起对应 AppHost 进程
+4. Gateway 分配 Session ID，建立双向映射：
+   Client_Socket ↔ Session_ID ↔ AppHost_Socket
+5. Gateway 向 Client 返回 SESSION_ACK
+6. 后续数据按 Session ID 精准路由
 ```
 
-网关不解析消息内容，不做任何修改，纯透明转发。
+#### 进程生命周期管理
 
----
+- **动态拉起**：解析 `SPAWN_APP` 指令后，通过 `fork()` + `exec()` 创建独立 AppHost 进程
+- **健康监测**：定期检测 AppHost 进程存活状态
+- **孤儿回收**：自动回收崩溃或断连的 AppHost 进程，防止资源泄露
+- **进程隔离**：每个 AppHost 运行在独立进程空间，单个崩溃不影响其他会话
 
-### 6.2 UDPSocket（UDP 封装）
+### 6.2 AppHost（应用宿主）
 
-**文件：** [UDPSocket.h](UDPSocket.h) / [UDPSocket.cpp](UDPSocket.cpp)
+**目录**：`src/apphost/`
 
-跨平台的 UDP Socket 封装，屏蔽 Windows（Winsock2）和 Linux（POSIX）的差异。
+AppHost 是服务端的核心执行单元，负责加载业务插件、执行渲染、检测差分并发送像素数据。
 
-**主要接口：**
+#### 启动流程
 
-| 方法 | 说明 |
-|------|------|
-| `Initialize()` | 初始化（Windows 下初始化 Winsock） |
-| `Create()` | 创建 UDP socket |
-| `Bind(port)` | 绑定本地端口 |
-| `SetNonBlocking(bool)` | 设置非阻塞模式 |
-| `SendTo(data, ip, port)` | 发送 UDP 数据包 |
-| `CheckForData()` | 用 `select()` 检查是否有数据可读 |
-| `HandleIncomingData(callback)` | 接收数据并通过回调函数处理 |
+```
+1. 由 Gateway 通过 fork/exec 拉起
+2. 通过 dlopen() 加载指定的业务 .so 插件
+3. 通过 dlsym() 解析 IGuiApplication 入口符号
+4. 创建 IUiHost 实现实例，注入业务逻辑
+5. 初始化虚拟像素缓冲区
+6. 启动渲染循环与差分检测
+7. 建立与 Gateway 的 TCP 连接
+```
 
----
+#### 像素差分传输流程
 
-### 6.3 ImageHandler（图像处理）
+```
+业务逻辑调用 IUiHost 接口
+    ↓
+AppHost 在本地完成真实渲染 → 写入内存像素缓冲区（当前帧）
+    ↓
+逐帧差分检测：对比当前帧与上一帧 → 定位脏矩形区域
+    ↓
+提取脏矩形内的像素数据 → 压缩
+    ↓
+封装为 DIRTY_RECT 协议包（含帧序列号、矩形坐标、像素数据）
+    ↓
+通过 TCP 发送至 Gateway → 路由到对应 Client
+```
 
-**文件：** [ImageHandler.h](ImageHandler.h) / [ImageHandler.cpp](ImageHandler.cpp)
+#### 接收处理
 
-负责图像文件的读写和分包/合包。
+- 收到 `MOUSE_EVENT`：转换为业务逻辑可识别的输入事件，注入 IUiHost 事件队列
+- 收到 `KEYBOARD_EVENT`：同上，支持多键组合与拖拽等复杂操作
+- 收到 `APP_EXIT`：清理资源，退出进程
 
-**主要接口：**
+### 6.3 Client（客户端）
 
-| 方法 | 说明 |
-|------|------|
-| `LoadImageFile(path)` | 读取图像文件为字节数组 |
-| `SaveImageFile(path, data)` | 将字节数组写入图像文件 |
-| `ScanImageDirectory(dir)` | 扫描目录，返回所有图像文件路径 |
-| `SplitImageData(data, maxSize)` | 将图像数据拆分为最大 8192 字节的包 |
-| `MergeImageData(packets, total, out)` | 将所有包合并为完整图像 |
+**目录**：`src/client/`
 
-**支持的图像格式：** `.jpg`、`.jpeg`、`.png`、`.bmp`、`.gif`
+客户端基于 **FLTK (Fast Light Toolkit)** 图形库构建，负责像素重构与输入采集。
 
----
+#### 启动流程
 
-### 6.4 Protocol（协议序列化）
+```
+1. 初始化 FLTK 窗口
+2. 建立与 Gateway 的 TCP 连接
+3. 发送 SPAWN_APP 请求
+4. 收到 SESSION_ACK，获得 Session ID
+5. 进入主事件循环
+```
 
-**文件：** [Protocol.h](Protocol.h) / [Protocol.cpp](Protocol.cpp)
+#### 像素重构流程
+
+```
+从 Gateway 接收 DIRTY_RECT 数据包
+    ↓
+解析帧序列号、脏矩形坐标与像素数据
+    ↓
+（可选）丢弃过期帧的脏矩形（帧序列号过时）
+    ↓
+解压像素数据
+    ↓
+通过 BitBlt（内存贴图）直接写入窗口对应区域
+    ↓
+触发局部重绘，完成界面实时重构
+```
+
+> 客户端**无需任何本地绘图逻辑**，仅做像素搬运。
+
+#### 输入事件采集
+
+- 捕获 Raw Input 原始鼠标/键盘事件
+- 标准化封装（坐标偏移、按键码、时间戳）
+- 附加 Session ID 后发送至 Gateway 透传
+
+### 6.4 网络传输层
+
+**目录**：`src/network/`
+
+提供跨平台的 TCP Socket 封装与 I/O 多路复用抽象：
+
+```
+socket.h                  ◄── Socket 抽象接口
+tcp_socket.h              ◄── TCP Socket 封装声明
+├── tcp_socket_linux.cpp      Linux POSIX Socket 实现
+└── tcp_socket_win.cpp        Windows Winsock2 实现
+
+event_loop.h              ◄── I/O 多路复用抽象接口
+├── epoll_event_loop.cpp      Linux epoll 实现
+└── select_event_loop.cpp     通用 select 实现（Windows/跨平台）
+```
+
+- TCP 为唯一传输方案，保证指令级可靠传输
+- 平台差异通过编译期条件选择对应实现文件
+- I/O 多路复用抽象支持 Gateway 的高并发连接管理
+
+### 6.5 协议层
+
+**目录**：`src/protocol/`
 
 负责消息的**序列化**（结构体 → 字节流）和**反序列化**（字节流 → 结构体）。
 
-所有多字节整数在序列化时转换为大端序，反序列化时转回主机字节序。
+- 所有多字节整数在序列化时转换为大端序（网络字节序），反序列化时转回主机字节序
+- 通过状态机模式实现 TCP 粘包/半包的完整解析
+- Magic Number 校验确保协议一致性
 
 ---
 
-### 6.5 ServerApp（服务端）
+## 7. 关键算法与机制
 
-**文件：** [ServerApp.cpp](ServerApp.cpp)
+### 7.1 脏矩形差分检测
 
-**启动流程：**
-1. 初始化 UDP Socket，绑定 9002 端口
-2. 扫描 `E:\image` 目录，加载所有图像
-3. 启动各工作线程
-4. 主线程进入接收循环
-
-**图像发送流程：**
-```
-扫描目录 → 读取图像文件 → SplitImageData 拆包
-→ 逐包发送（通过 Gateway 到 Client）
-→ 等待 ACK → 超时重传 → 全部 ACK 后标记完成
-→ 发送下一张图像
-```
-
-**接收处理：**
-- 收到 `ACK`：标记对应包已确认
-- 收到 `RETRANSMIT_REQ`：立即重发指定包
-- 收到 `MOUSE_EVENTS` / `KEYBOARD_EVENT`：放入事件队列，由事件线程处理
-
----
-
-### 6.6 Client（客户端）
-
-**文件：** [Client.cpp](Client.cpp)
-
-**启动流程：**
-1. 初始化 UDP Socket，绑定 9001 端口
-2. 启动维护线程
-3. 主线程进入接收循环
-
-**图像接收流程：**
-```
-收到 IMAGE_DATA 包 → 记录到 ImageReceiveState
-→ 发送 ACK → 检查是否收齐所有包
-→ 收齐后调用 MergeImageData 合包
-→ SaveImageFile 保存到 D:\image
-```
-
-**维护线程职责：**
-- 定期检查各图像的接收进度
-- 对缺失的包发送 `RETRANSMIT_REQ`
-- 根据进度自适应调整请求频率
-- 超过 5 分钟未完成则放弃该图像
-
----
-
-## 7. 关键算法
-
-### 7.1 图像拆包
+AppHost 维护两帧像素缓冲区（当前帧与前一帧），逐帧对比定位变化区域：
 
 ```
-图像总大小 / 8192 = 包数（向上取整）
-
-例：一张 20000 字节的图像：
-  包 0：字节 0    ~ 8191   （8192 字节）
-  包 1：字节 8192 ~ 16383  （8192 字节）
-  包 2：字节 16384~ 19999  （3616 字节，最后一包可能更小）
+1. 业务逻辑渲染完成 → 当前帧写入缓冲区 A
+2. 逐行扫描对比缓冲区 A 与缓冲区 B（前一帧）
+3. 记录所有发生变化的像素坐标
+4. 将变化像素聚合为最小外接矩形（脏矩形）
+5. 可进一步拆分为多个不相交的脏矩形以减少冗余传输
+6. 提取脏矩形内像素数据 → 压缩 → 封包发送
+7. 交换缓冲区：A → B，准备下一帧
 ```
 
-### 7.2 自适应补包频率
+**优势**：相较于全量位图/视频流传输（如 RDP/VNC），仅传输实际变化的像素区域，在界面变化较少时（如文本编辑、表单操作）可将带宽降低一个数量级。
 
-客户端维护线程根据当前接收进度动态调整等待间隔：
+### 7.2 帧序列号与选择性丢弃
 
-| 接收进度 | 补包请求间隔 |
-|----------|-------------|
-| < 20%    | 2000 ms     |
-| 20% ~ 50% | 1000 ms   |
-| 50% ~ 80% | 500 ms    |
-| > 80%    | 200 ms      |
+每个 DIRTY_RECT 包携带帧序列号（frameSeq），客户端据此处理：
 
-> 越接近完成，请求越频繁，加速收尾阶段。
+- 正常情况：按序重绘
+- 网络拥塞/丢包：如果收到更新帧的脏矩形，可安全丢弃旧帧的待处理矩形（因为新帧已覆盖该区域）
+- 时间戳同步：输入事件携带时间戳，用于服务端精确回放
 
-### 7.3 图像合包验证
+### 7.3 动态进程调度
 
-合包时进行以下验证：
-1. 已收到的包数量 == totalPackets
-2. 包序号连续（0, 1, 2, ... totalPackets-1），无缺失
-3. 合并后总大小 > 0
+Gateway 的进程调度流程：
+
+```
+收到 SPAWN_APP("app1.so")
+    ↓
+检查 app1.so 是否存在且合法
+    ↓
+fork() → 子进程
+    ↓
+子进程: exec() 加载 AppHost 可执行文件，传入 app1.so 路径
+    ↓
+父进程 (Gateway):
+  · 记录子进程 PID
+  · 等待 AppHost 建立 TCP 连接
+  · 建立 Session 映射
+  · 向 Client 返回 SESSION_ACK
+```
 
 ---
 
 ## 8. 配置参数
 
-所有配置均为代码中的编译期常量（无配置文件）：
-
 ### 网络配置
 
 | 参数 | 值 | 说明 |
 |------|----|------|
-| GATEWAY_IP | 127.0.0.1 | 网关 IP |
-| GATEWAY_PORT | 9000 | 网关端口 |
-| CLIENT_PORT | 9001 | 客户端端口 |
-| APP_PORT | 9002 | 服务端端口 |
+| GATEWAY_PORT | 可配置 | 网关监听端口 |
+| MAGIC_NUMBER | 0x50445347 | 协议标识 ("PDSG") |
 
 ### 协议参数
 
+| 参数 | 说明 |
+|------|------|
+| HEADER_SIZE | 协议头固定长度 (13 bytes) |
+| MAX_BODY_SIZE | 单包最大载荷大小 |
+| HEARTBEAT_INTERVAL | 心跳包发送间隔 |
+| SESSION_TIMEOUT | 会话无活动超时时间 |
+| FRAME_RATE_LIMIT | 帧率上限（脏矩形发送频率） |
+
+### 构建配置
+
 | 参数 | 值 | 说明 |
 |------|----|------|
-| MAX_PACKET_SIZE | 8192 字节 | 单包最大数据量 |
-| ACK_TIMEOUT | 2000 ms | 服务端等待 ACK 超时 |
-| PACKET_TIMEOUT | 1000 ms | 包级别超时 |
-| TRANSFER_TIMEOUT | 300000 ms（5分钟）| 整体传输超时 |
-| SCAN_INTERVAL | 60000 ms（1分钟）| 目录重扫间隔 |
-
-### 文件路径
-
-| 参数 | 值 | 说明 |
-|------|----|------|
-| 服务端图像源目录 | `E:\image` | 服务端读取图像的目录（Windows 路径） |
-| 客户端图像保存目录 | `D:\image` | 客户端保存图像的目录（Windows 路径） |
+| Bazel 版本 | 7.4.1 | 构建系统版本 |
+| C++ 标准 | C++17 | 编译标准 |
+| GKC 框架 | git submodule | 第三方依赖 |
 
 ---
 
@@ -422,50 +692,37 @@ struct ImageSendState {
 
 ### 依赖
 
-- C++17 编译器（MSVC / GCC / Clang）
-- Windows：Winsock2（系统自带）
-- Linux：POSIX threads（`-lpthread`）
+- C++17 编译器（GCC / Clang / MSVC）
+- Bazel 7.4.1
+- FLTK（客户端图形库）
+- GKC 框架（git submodule，自动拉取）
+- Linux：POSIX threads、epoll、dlopen
+- Windows：Winsock2、LoadLibrary
 
-### Windows（MSVC）
-
-```bat
-:: 编译网关
-cl /EHsc /std:c++17 Gateway.cpp Protocol.cpp UDPSocket.cpp /Fe:Gateway.exe
-
-:: 编译客户端
-cl /EHsc /std:c++17 Client.cpp Protocol.cpp UDPSocket.cpp ImageHandler.cpp /Fe:Client.exe
-
-:: 编译服务端
-cl /EHsc /std:c++17 ServerApp.cpp Protocol.cpp UDPSocket.cpp ImageHandler.cpp /Fe:ServerApp.exe
-```
-
-### Linux（g++）
+### 构建
 
 ```bash
-# 编译网关
-g++ -std=c++17 -pthread Gateway.cpp Protocol.cpp UDPSocket.cpp -o Gateway
+# 构建全部目标
+bazel build //...
 
-# 编译客户端
-g++ -std=c++17 -pthread Client.cpp Protocol.cpp UDPSocket.cpp ImageHandler.cpp -o Client
-
-# 编译服务端
-g++ -std=c++17 -pthread ServerApp.cpp Protocol.cpp UDPSocket.cpp ImageHandler.cpp -o ServerApp
+# 单独构建
+bazel build //src/gateway:gateway
+bazel build //src/apphost:apphost
+bazel build //src/client:client
 ```
 
 ### 运行顺序
 
-必须按以下顺序启动（网关需最先运行）：
-
 ```bash
-# 终端 1：先启动网关
-./Gateway
+# 1. 启动网关（必须最先启动）
+./bazel-bin/src/gateway/gateway
 
-# 终端 2：启动服务端（确保 E:\image 目录存在且有图像）
-./ServerApp
-
-# 终端 3：启动客户端（确保 D:\image 目录存在）
-./Client
+# 2. 客户端连接网关，发送 SPAWN_APP 请求后
+#    网关自动拉起 AppHost 进程，无需手动启动
+./bazel-bin/src/client/client
 ```
+
+> AppHost 进程由 Gateway 动态管理，无需手动启动。
 
 ---
 
@@ -475,21 +732,20 @@ g++ -std=c++17 -pthread ServerApp.cpp Protocol.cpp UDPSocket.cpp ImageHandler.cp
 
 | 亮点 | 说明 |
 |------|------|
-| 模块化设计 | 协议、Socket、图像处理各自独立，职责清晰 |
-| 跨平台支持 | UDPSocket 封装了 Windows/Linux 差异 |
-| UDP 可靠化 | ACK + 超时重传 + 主动补包，三重保障 |
-| 自适应策略 | 补包频率随进度动态调整，提升传输效率 |
-| 非阻塞 I/O | 使用 `select()` 避免阻塞，提升响应性 |
-| 线程安全 | 共享状态均使用 mutex 保护 |
+| **应用级虚拟化** | 以独立应用为粒度，区别于 RDP/VNC 的桌面镜像模式 |
+| **IUiHost 接口解耦** | 业务逻辑与渲染引擎彻底分离，支持本地/远程模式无缝切换 |
+| **像素差分传输** | 脏矩形检测 + 压缩，大幅降低带宽消耗 |
+| **智能网关调度** | Session 管理 + 动态路由 + 进程生命周期，支持水平扩展 |
+| **TCP 可靠传输** | 自定义二进制协议，状态机解包，解决粘包/半包问题 |
+| **进程级隔离** | fork/exec 独立进程空间，单点故障不影响全局 |
+| **跨平台支持** | 传输层封装 Windows/Linux 差异，GKC 框架统一 API |
+| **帧序列号机制** | 支持客户端在弱网下选择性丢弃过期帧 |
 
 ### 已知局限
 
 | 局限 | 说明 |
 |------|------|
-| 硬编码路径 | 图像目录为 Windows 绝对路径，跨平台需修改 |
-| 无配置文件 | 所有参数为编译期常量，修改需重新编译 |
-| 无数据校验 | 没有 CRC/校验和，无法检测数据损坏 |
-| 无加密认证 | 数据明文传输，无身份验证 |
-| 仅支持本机 | IP 硬编码为 127.0.0.1，无法跨网络使用 |
-| 内存占用 | 整张图像完整加载到内存 |
-| 网关单线程 | 高并发下网关可能成为瓶颈 |
+| 像素压缩算法 | 当前使用基础压缩，未集成硬件加速编码 |
+| 音频传输 | 协议暂不支持音频流传输 |
+| 多显示器 | 暂不支持多显示器场景 |
+| GPU 加速 | 服务端渲染未利用 GPU 硬件加速 |

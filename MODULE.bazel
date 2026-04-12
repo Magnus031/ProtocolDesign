@@ -1,3 +1,5 @@
 module(name = "protocol_design", version = "0.1")
 
 bazel_dep(name = "rules_foreign_cc", version = "0.15.1")
+# Google Test dependency
+bazel_dep(name = "googletest", version = "1.17.0.bcr.2")

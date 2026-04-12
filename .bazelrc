@@ -1,0 +1,10 @@
+# Set C++17 as the default standard
+build --cxxopt=-std=c++17
+build --host_cxxopt=-std=c++17
+test --cxxopt=-std=c++17
+
+# Enable C++17 features
+build --cxxopt=-Wno-c++17-extensions
+
+# Increase timeout for tests if needed
+test --test_timeout=300

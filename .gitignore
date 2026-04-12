@@ -3,3 +3,5 @@ third_party/GKC/build/
 bazel-*
 
 third_party/GKC_BUILD/
+
+docs/GKC/

@@ -5,3 +5,7 @@ bazel-*
 third_party/GKC_BUILD/
 
 docs/GKC/
+
+docs/plan/
+
+CLAUDE.md

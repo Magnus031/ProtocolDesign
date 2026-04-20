@@ -144,16 +144,6 @@ ProtocolDesign/
 │   │   ├── message_parser.cpp
 │   │   └── BUILD
 │   │
-│   ├── network/               # 网络传输层
-│   │   ├── socket.h           # Socket 抽象接口
-│   │   ├── tcp_socket.h       # TCP Socket 封装声明
-│   │   ├── tcp_socket_linux.cpp   # Linux POSIX Socket 实现
-│   │   ├── tcp_socket_win.cpp     # Windows Winsock2 实现
-│   │   ├── event_loop.h       # I/O 多路复用抽象接口
-│   │   ├── epoll_event_loop.cpp   # Linux epoll 实现
-│   │   ├── select_event_loop.cpp  # 通用 select 实现（Windows/跨平台）
-│   │   └── BUILD
-│   │
 │   ├── gateway/               # 智能网关（可执行程序）
 │   │   ├── gateway.h          # 网关核心类声明
 │   │   ├── gateway.cpp        # 网关核心逻辑
@@ -580,24 +570,13 @@ AppHost 在本地完成真实渲染 → 写入内存像素缓冲区（当前帧�
 
 ### 6.4 网络传输层
 
-**目录**：`src/network/`
+网络 I/O 直接使用 **GKC `IoPool`**（`GKC/RT/GkcSys/public/_GkcSys.h`），不设独立的 `src/network/` 模块。
 
-提供跨平台的 TCP Socket 封装与 I/O 多路复用抽象：
+- Linux 底层：epoll 事件驱动
+- Windows 底层：IOCP 事件驱动
+- 接口统一：`StartListen` / `StartConnect` / `BeginInput` / `DisableHandle`
 
-```
-socket.h                  ◄── Socket 抽象接口
-tcp_socket.h              ◄── TCP Socket 封装声明
-├── tcp_socket_linux.cpp      Linux POSIX Socket 实现
-└── tcp_socket_win.cpp        Windows Winsock2 实现
-
-event_loop.h              ◄── I/O 多路复用抽象接口
-├── epoll_event_loop.cpp      Linux epoll 实现
-└── select_event_loop.cpp     通用 select 实现（Windows/跨平台）
-```
-
-- TCP 为唯一传输方案，保证指令级可靠传输
-- 平台差异通过编译期条件选择对应实现文件
-- I/O 多路复用抽象支持 Gateway 的高并发连接管理
+各组件用法：Gateway 调用 `StartListen` 监听客户端并 `StartConnect` 对接 AppHost；AppHost / Client 均调用 `StartConnect` 连接 Gateway。
 
 ### 6.5 协议层
 

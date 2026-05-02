@@ -12,12 +12,13 @@
 8. [配置参数](#8-配置参数)
 9. [编译与运行](#9-编译与运行)
 10. [设计亮点与已知局限](#10-设计亮点与已知局限)
+11. [端到端交互 Demo](#11-端到端交互-demo)
 
 ---
 
 ## 1. 项目简介
 
-本项目是一个用 **C++17** 编写的、基于 **TCP** 的应用级 UI 虚拟化通信协议实现系统。
+本项目是一个用 **C++14** 编写的、基于 **TCP** 的应用级 UI 虚拟化通信协议实现系统。
 
 ### 核心理念
 
@@ -26,7 +27,7 @@
 ### 它能做什么？
 
 - **应用级 UI 虚拟化**：以独立应用（而非整个桌面）为粒度，实现远程界面的实时传输与交互，区别于 RDP/VNC 的桌面镜像模式。
-- **像素矩阵差分传输**：AppHost 在服务端本地完成渲染，通过脏矩形差分检测仅传输变化区域的像素数据，大幅降低带宽消耗。
+- **脏矩形增量传输**：AppHost 在服务端本地完成渲染，GKC 的 `DoDraw` 回调天然携带本次重绘的脏矩形（`rcPaint`），仅传输变化区域的像素数据，大幅降低带宽消耗，无需逐帧像素比对。
 - **输入事件实时同步**：客户端捕获鼠标/键盘事件，标准化封装后通过网关精准路由至对应的后端 AppHost 进程。
 - **智能网关调度**：网关支持多客户端并发接入、动态路由、AppHost 进程的生命周期管理，天然支持水平扩展。
 - **业务逻辑解耦**：通过 IUiHost 接口抽象，使业务代码（.so/.dll 插件）无需感知网络存在，可在本地渲染与远程传输模式间自由切换。
@@ -49,11 +50,11 @@
 ```
 ┌──────────────────┐                ┌──────────────────┐                ┌──────────────────┐
 │     Client       │    TCP 长连接   │     Gateway      │    TCP 长连接   │    AppHost(s)    │
-│   (FLTK 客户端)  │◄──────────────►│   (智能网关)      │◄──────────────►│  (应用宿主进程)   │
+│   (GKC 客户端)   │◄──────────────►│   (智能网关)      │◄──────────────►│  (应用宿主进程)   │
 │                  │                │                  │                │                  │
-│ · 像素重构(BitBlt)│   单端口接入    │ · Session 管理    │   动态路由      │ · 加载业务 .so    │
+│ · 像素重构(DoDraw)│   单端口接入    │ · Session 管理    │   动态路由      │ · 加载业务 .so    │
 │ · 输入事件采集    │                │ · 动态路由转发     │                │ · 本地渲染        │
-│ · 窗口管理       │                │ · 进程生命周期     │                │ · 脏矩形检测      │
+│ · GKC 窗口管理   │                │ · 进程生命周期     │                │ · 脏矩形检测      │
 │                  │                │ · epoll 多路复用   │                │ · 像素差分发送     │
 └──────────────────┘                └──────────────────┘                └──────────────────┘
 ```
@@ -93,27 +94,30 @@
 
 **Gateway（智能网关）：**
 ```
-主线程 (epoll/select)  ──► 监听客户端连接、I/O 多路复用
-路由分发               ──► 解析 Session ID，精准路由数据包
-进程管理               ──► fork/exec 拉起 AppHost，回收孤儿进程
-心跳监测               ──► 检测客户端/AppHost 存活状态
+主线程                 ──► 初始化；启动后调用 _IoPool_Fetch() 接管事件驱动
+IoPool 线程 (GKC 内部) ──► epoll 监听客户端/AppHost 连接；_IoFunc 回调分发
+路由分发               ──► _IoFunc 回调内：MessageParser 解包 → 按 SessionID 路由转发
+进程管理               ──► 收到 SPAWN_APP 后 fork/exec 拉起 AppHost，waitpid 回收
+心跳监测               ──► WorkPool 慢速池定时任务检测客户端/AppHost 存活
 ```
 
 **AppHost（应用宿主）：**
 ```
-主线程                 ──► 加载业务 .so 插件 (dlopen/dlsym)
-渲染线程               ──► 执行业务逻辑，写入像素缓冲区
-差分检测线程           ──► 逐帧对比，定位脏矩形区域
-数据发送线程           ──► 压缩像素数据，封包发往 Gateway
-事件接收线程           ──► 接收并分发客户端输入事件
+主线程                 ──► 加载业务 .so 插件 (dlopen/dlsym)；运行 GuiHelper::Loop() 或事件循环
+IoPool 线程 (GKC 内部) ──► 与 Gateway 的网络 I/O 事件回调（RECEIVED / SENT / BEFORE_CLOSE）
+WorkPool 快速池        ──► PIXEL_DATA 打包发送（DoDraw 触发后投递，无逐帧像素比对）
+WorkPool 慢速池        ──► 像素数据压缩任务（耗时操作）
+PostWork               ──► IoPool 回调将输入事件安全投递给主线程的 ui_host_impl
 ```
 
 **Client（客户端）：**
 ```
-主事件循环 (FLTK)      ──► 接收像素数据包，BitBlt 贴图重构界面
-输入采集               ──► 捕获鼠标/键盘 Raw Input 事件
-网络接收线程           ──► 从 Gateway 接收数据，解包分发
-心跳发送               ──► 定期发送心跳维持会话
+主线程 (GKC GuiHelper::Loop)  ──► UI 事件循环；DoDraw 写像素，DoMouse/DoKeyboard 采集输入
+IoPool 线程 (GKC 内部)        ──► 网络 I/O 事件回调（IO_TYPE_RECEIVED / IO_TYPE_SENT 等）
+回调分发                      ──► IoPool 收到数据 → MessageParser.Feed() → 按 CmdType 分发
+PostWork                      ──► 从 IoPool 线程安全地向主线程投递像素更新任务
+WorkPool（可选）              ──► 像素解压缩等 CPU 密集任务
+心跳发送                      ──► 通过 TimerImpl 在主线程定时触发，经 IoPool 发送
 ```
 
 ---
@@ -138,77 +142,90 @@ ProtocolDesign/
 │
 ├── src/                       # 源代码目录
 │   ├── protocol/              # 协议层：消息定义与序列化
-│   │   ├── protocol.h         # 消息类型枚举、协议头结构体
+│   │   ├── protocol.h         # CmdType 枚举、Header 结构体、Packet 载体
 │   │   ├── protocol.cpp       # 序列化/反序列化实现
-│   │   ├── message_parser.h   # TCP 粘包/半包状态机解析器
+│   │   ├── message_parser.h   # TCP 粘包/半包状态机解析器（Pull 模型）
 │   │   ├── message_parser.cpp
 │   │   └── BUILD
 │   │
+│   ├── common/                # 公共工具库（三个组件共用）
+│   │   ├── byte_order.h       # 大端序/主机字节序转换宏
+│   │   ├── message_handler.h  # CmdType 分发器：包装 MessageParser，注册/触发处理器
+│   │   ├── message_handler.cpp
+│   │   ├── logger.h           # 日志接口
+│   │   ├── logger.cpp
+│   │   └── BUILD
+│   │
 │   ├── gateway/               # 智能网关（可执行程序）
-│   │   ├── gateway.h          # 网关核心类声明
-│   │   ├── gateway.cpp        # 网关核心逻辑
-│   │   ├── session_manager.h  # Session 管理（路由表维护）
+│   │   ├── gateway.h          # 网关核心类：IoPool 监听，MessageHandler 路由
+│   │   ├── gateway.cpp
+│   │   ├── session_manager.h  # SessionID ↔ (client_conn, apphost_conn) 双向映射
 │   │   ├── session_manager.cpp
-│   │   ├── process_manager.h  # AppHost 进程生命周期管理
+│   │   ├── process_manager.h  # fork/exec 拉起 AppHost，waitpid 回收
 │   │   ├── process_manager.cpp
-│   │   ├── main.cpp           # 入口
+│   │   ├── main.cpp
 │   │   └── BUILD
 │   │
-│   ├── apphost/               # 应用宿主（可执行程序，由 Gateway 动态拉起）
-│   │   ├── apphost.h          # AppHost 核心类声明
-│   │   ├── apphost.cpp        # AppHost 核心逻辑
-│   │   ├── ui_host_impl.h     # IUiHost 接口的远程模式实现
+│   ├── apphost/               # AppHost（可执行程序，由 Gateway 动态拉起）
+│   │   ├── apphost.h          # IoPool + MessageHandler；加载插件；管理 ui_host_impl
+│   │   ├── apphost.cpp
+│   │   ├── ui_host_impl.h     # 假的 IUiHost：拦截 DoDraw→rcPaint→PIXEL_DATA；dispatch 输入事件
 │   │   ├── ui_host_impl.cpp
-│   │   ├── pixel_buffer.h     # 像素缓冲区管理
-│   │   ├── pixel_buffer.cpp
-│   │   ├── dirty_rect_detector.h   # 脏矩形差分检测
-│   │   ├── dirty_rect_detector.cpp
-│   │   ├── plugin_loader.h    # .so/.dll 插件动态加载
+│   │   ├── pixel_capture.h    # capture_rect(pBuffer, width, rcPaint)→像素字节；供 ui_host_impl 使用
+│   │   ├── pixel_capture.cpp
+│   │   ├── plugin_loader.h    # dlopen/dlsym("sa_ui_main")，调用 Exec()
 │   │   ├── plugin_loader.cpp
-│   │   ├── main.cpp           # 入口
+│   │   ├── main.cpp
 │   │   └── BUILD
 │   │
-│   ├── client/                # 客户端（可执行程序）
-│   │   ├── client.h           # 客户端核心类声明
-│   │   ├── client.cpp         # 客户端核心逻辑
-│   │   ├── window.h           # FLTK 窗口管理
-│   │   ├── window.cpp
-│   │   ├── input_handler.h    # 鼠标/键盘输入采集
-│   │   ├── input_handler.cpp
-│   │   ├── pixel_renderer.h   # 像素重构（BitBlt 贴图）
+│   ├── client/                # Client（可执行程序，通用插件加载器，与 AppHost 对称）
+│   │   ├── client.h           # IoPool StartConnect；MessageHandler 注册 SESSION_ACK/PIXEL_DATA
+│   │   ├── client.cpp
+│   │   ├── plugin_loader.h    # dlopen（Linux）/ LoadLibrary（Windows）加载 .so/.dll
+│   │   ├── plugin_loader.cpp
+│   │   ├── pixel_renderer.h   # 线程安全像素缓冲区（mutex）；供 client_viewer 插件使用
 │   │   ├── pixel_renderer.cpp
-│   │   ├── main.cpp           # 入口
+│   │   ├── main.cpp           # 解析 --plugin/--gateway-host/--gateway-port；加载插件
 │   │   └── BUILD
 │   │
-│   └── common/                # 公共工具库
-│       ├── types.h            # 通用类型定义（ui_rect, ui_point, ColorQuad）
-│       ├── byte_order.h       # 大端序/主机字节序转换工具
-│       ├── logger.h           # 日志接口
-│       ├── logger.cpp         # 日志实现
-│       └── BUILD
+│   └── (无 src/network/ 模块)  # 网络 I/O 直接由 GKC IoPool 提供
 │
-├── tests/                     # 测试目录
+├── plugins/                   # 业务插件（独立共享库，可热替换）
+│   ├── demo_app/              # 服务端应用插件（AppHost 加载）
+│   │   ├── demo_app.cpp       # ToplevelImpl：DoDraw 画色块，DoMouse 点击换色，DoKeyboard Space 切色
+│   │   └── BUILD              # 构建为 libdemo_app.so
+│   └── client_viewer/         # 客户端查看器插件（Client 加载）
+│       ├── client_viewer.cpp  # ToplevelImpl：DoDraw 贴 PixelRenderer 缓冲，DoMouse/DoKeyboard 打包发送
+│       └── BUILD              # 构建为 libclient_viewer.so（Linux）/ client_viewer.dll（Windows）
+│
+├── tests/                     # 顶层测试目录
 │   └── BUILD
 │
 └── third_party/               # 第三方依赖
     ├── BUILD
-    ├── GKC/                   # GKC (General Kind C++) 框架
-    │   ├── public/include/
-    │   │   ├── base/          # 基础框架 (GkcDef.h, GkcFrame.h)
-    │   │   ├── sys/           # 系统工具 (GkcSys.h: 文件、流、线程)
-    │   │   └── ui/            # UI 框架 (IUiHost, IUiWindow 接口定义)
-    │   │       └── system/
-    │   │           ├── host_types.h   # i_ui_host, i_ui_window 接口
-    │   │           └── basic_types.h  # ui_rect, ui_point, ColorQuad 等类型
-    │   └── ...
-    └── GKC_BUILD/             # GKC 预编译产物
-        └── release/bin/Release/
-            ├── GkcSys.dll     # Windows 动态库
-            └── GkcSys.lib     # Windows 导入库
+    └── GKC/                   # GKC (General Kind C++) 框架
+        ├── public/include/
+        │   ├── base/
+        │   │   ├── GkcDef.h       # 基础类型、LiteCom/RefPtr/UniquePtr、UI 接口定义
+        │   │   ├── GkcGui.h       # GUI 包装层：_Window/_Toplevel, ToplevelImpl<T>, WorkImpl, TimerImpl
+        │   │   ├── GkcCga.h       # CGA / raster 入口（上游 51049a4 新增）
+        │   │   └── system/
+        │   │       └── ui_types.h # UiSize, UiPoint, UiRect, ColorQuad 等几何/像素类型
+        │   └── sys/
+        │       └── GkcSys.h       # 系统工具入口
+        ├── RT/GkcSys/public/
+        │   └── _GkcSys.h          # IoPool / WorkPool 运行时接口
+        ├── doxygen/               # 上游分层与组件文档
+        └── util/
+            ├── private/include/ui/ # UIHost 平台私有头（uihost 可执行程序依赖）
+            └── gui/
+                ├── uihost/        # GKC UIHost 实现（Wayland/Win32 后端）
+                └── LocalDesk/     # GKC GUI 程序范式示例（ToplevelImpl 用法）
 ```
 
-> **构建系统**：Bazel 7.4.1，通过 `rules_foreign_cc` 集成 GKC 框架的 CMake 构建。
-> 三个可执行目标：Gateway、AppHost、Client 分别独立编译。
+> **构建系统**：Bazel 7.4.1。可执行目标：`gateway`、`apphost`、`client`；共享库目标：`demo_app`、`client_viewer`。
+> `src/common/` 中的 `MessageHandler` 被三个可执行目标共同依赖。
+> 当前仓库记录的 GKC submodule 快照为 `51049a4`。相较之前的 `1152096`，上游新增了基础 CGA 头文件和 multi-dimensional array 相关类型。
 
 ---
 
@@ -247,31 +264,30 @@ ProtocolDesign/
 
 ### 4.3 指令类型（Cmd Type）
 
+以下枚举与 `src/protocol/protocol.h` 中的实际实现完全对应：
+
 ```cpp
 enum class CmdType : uint8_t {
     // 会话管理
-    SPAWN_APP       = 0x01,  // 请求拉起 AppHost 进程
-    SESSION_ACK     = 0x02,  // 会话建立确认，返回 Session ID
-    HEARTBEAT       = 0x03,  // 心跳包
-
-    // 输入事件
-    MOUSE_EVENT     = 0x10,  // 鼠标事件（移动、点击、滚轮）
-    KEYBOARD_EVENT  = 0x11,  // 键盘事件（按下/释放）
+    HEARTBEAT     = 0x01,  // 心跳包，Body 为空，双向
+    SPAWN_APP     = 0x02,  // Client → Gateway：请求启动 AppHost 进程
+    SESSION_ACK   = 0x03,  // Gateway → Client：会话建立确认，携带 session_id
 
     // 像素传输
-    DIRTY_RECT      = 0x20,  // 脏矩形像素数据
-    FRAME_ACK       = 0x21,  // 帧确认（客户端已完成重绘）
-    WINDOW_STATE    = 0x22,  // 窗口状态更新（尺寸、位置）
+    PIXEL_DATA    = 0x10,  // AppHost → Client：脏矩形像素数据
 
-    // 控制指令
-    APP_EXIT        = 0xF0,  // 应用退出通知
-    ERROR           = 0xFF   // 错误消息
+    // 输入事件（鼠标与键盘合并为一个 CmdType，靠 Body 首字节 eventType 区分）
+    INPUT_EVENT   = 0x20,  // Client → AppHost：鼠标或键盘事件
+
+    // 控制
+    CLOSE_SESSION = 0xFE,  // 任意方向：优雅关闭会话
+    ERROR_RESP    = 0xFF,  // 任意方向：协议级错误通知
 };
 ```
 
 ### 4.4 各类型载荷格式
 
-**SPAWN_APP 请求载荷：**
+**SPAWN_APP 载荷：**
 ```
 ┌──────────────────┬──────────────────────┐
 │ appNameLength    │ appName              │
@@ -279,42 +295,40 @@ enum class CmdType : uint8_t {
 └──────────────────┴──────────────────────┘
 ```
 
-**鼠标事件（MOUSE_EVENT）载荷：**
+**PIXEL_DATA 载荷（AppHost → Client）：**
+```
+┌──────────┬──────────┬──────────┬───────────┬───────────┬─────────┬──────────┐
+│ frameSeq │ rectLeft │ rectTop  │ rectRight │ rectBottom│ dataLen │pixelData │
+│ (4 BE)   │ (4 BE)   │ (4 BE)   │ (4 BE)   │ (4 BE)   │ (4 BE)  │(variable)│
+└──────────┴──────────┴──────────┴───────────┴───────────┴─────────┴──────────┘
+```
+
+- `frameSeq`：帧序列号，Client 可据此丢弃过期帧
+- `rectLeft/Top/Right/Bottom`：脏矩形坐标（大端序 32 位整数）
+- `pixelData`：该区域的 ARGB 像素数据，行优先，与 `apphost.cpp` 中 `send_pixel_data()` 写法一致
+
+**INPUT_EVENT 载荷（Client → AppHost）：**
+
+鼠标与键盘共用 `CmdType::INPUT_EVENT = 0x20`，Body 首字节 `eventType` 区分具体事件：
+
+鼠标事件 (`eventType = 0x01~0x06`)：
 ```
 ┌──────────────┬──────────────────┬──────────────────┬──────────────────┐
 │ eventType    │ x                │ y                │ timestamp        │
 │ (1 byte)     │ (4 bytes BE)     │ (4 bytes BE)     │ (8 bytes BE)     │
 └──────────────┴──────────────────┴──────────────────┴──────────────────┘
+eventType: MOVE=0x01, LEFT_DOWN=0x02, LEFT_UP=0x03,
+           RIGHT_DOWN=0x04, RIGHT_UP=0x05, SCROLL=0x06
 ```
 
-鼠标事件类型：`MOVE=0x01`、`LEFT_DOWN=0x02`、`LEFT_UP=0x03`、`RIGHT_DOWN=0x04`、`RIGHT_UP=0x05`、`SCROLL=0x06`
-
-**键盘事件（KEYBOARD_EVENT）载荷：**
+键盘事件 (`eventType = 0x10~0x11`)：
 ```
-┌──────────────────┬──────────────┬──────────────────┐
-│ keyCode          │ isPressed    │ timestamp        │
-│ (2 bytes BE)     │ (1 byte)     │ (8 bytes BE)     │
-└──────────────────┴──────────────┴──────────────────┘
-```
-
-**脏矩形像素数据（DIRTY_RECT）载荷：**
-```
-┌────────────┬────────────┬────────────┬────────────┬──────────┬──────────┬──────────┐
-│ frameSeq   │ rectX      │ rectY      │ rectW      │ rectH    │ dataLen  │ pixelData│
-│ (4 bytes)  │ (4 bytes)  │ (4 bytes)  │ (4 bytes)  │ (4 bytes)│ (4 bytes)│(variable)│
-└────────────┴────────────┴────────────┴────────────┴──────────┴──────────┴──────────┘
-```
-
-- `frameSeq`：帧序列号，客户端可据此在丢包环境下执行有选择的脏矩形丢弃
-- `rectX/Y/W/H`：脏矩形在窗口中的坐标与尺寸
-- `pixelData`：该区域的 ARGB 像素矩阵数据（可压缩）
-
-**窗口状态（WINDOW_STATE）载荷：**
-```
-┌──────────────┬──────────────┬──────────────┬──────────────┐
-│ windowWidth  │ windowHeight │ posX         │ posY         │
-│ (4 bytes)    │ (4 bytes)    │ (4 bytes)    │ (4 bytes)    │
-└──────────────┴──────────────┴──────────────┴──────────────┘
+┌──────────────┬──────────────────┬──────────────────┐
+│ eventType    │ keyCode          │ timestamp        │
+│ (1 byte)     │ (2 bytes BE)     │ (8 bytes BE)     │
+└──────────────┴──────────────────┴──────────────────┘
+eventType: KEY_DOWN=0x10, KEY_UP=0x11
+keyCode: GKC KB_* 枚举值，Client 侧直接从 DoKeyboard(pKb->btKey) 填入
 ```
 
 ### 4.5 TCP 粘包/半包处理
@@ -356,44 +370,89 @@ enum class CmdType : uint8_t {
 
 ### 5.1 IUiHost 接口（来自 GKC 框架）
 
-IUiHost 是系统的核心抽象接口，实现业务逻辑对底层图形库的透明化：
+`IUiHost` 是 GKC 的 UI 宿主抽象，通过 `LcInterface<IUiHost>` 持有，对业务逻辑屏蔽底层平台（Wayland / Win32）。
+接口本体定义在 `GkcDef.h`，`GkcGui.h` 只是在其上提供 `_Window` / `ToplevelImpl<T>` /
+`WorkImpl<T>` / `TimerImpl<T>` 等薄包装。核心 API 如下：
 
 ```cpp
-// GKC::i_ui_host — 窗口宿主抽象接口
-class i_ui_host {
-public:
-    virtual int  Loop()                  noexcept = 0;  // 主事件循环
-    virtual void Quit()                  noexcept = 0;  // 退出事件循环
-    virtual i_ui_window* Create(int iType) noexcept = 0;  // 创建窗口
-    virtual void Destroy(i_ui_window* p) noexcept = 0;  // 销毁窗口
+struct IUiHost {
+    int  (*Loop)(void* pContext) noexcept;                   // 进入主事件循环（阻塞）
+    void (*Quit)(void* pContext) noexcept;                   // 退出事件循环
+    void (*PostWork)(void* pContext,
+                     const WorkProc& work, void* pData) noexcept; // 跨线程安全投递任务到主线程
+    uintptr (*AddTimer)(void* pContext, int iPeriod,
+                        const WorkProc& work, void* pData) noexcept;
+    void (*RemoveTimer)(void* pContext, uintptr id) noexcept;
+    uintptr (*CreateToplevel)(void* pContext, bool bResizable,
+                              int iWidth, int iHeight,
+                              IUiToplevel** ppInterface) noexcept;
+    // ... CreateDialogBox / CreatePopup / Destroy
 };
 
-// GKC::i_ui_window — 窗口接口
-class i_ui_window {
-public:
-    virtual void GetInfo(ui_window_info& info) noexcept = 0;
+// 业务代码通过全局实例访问
+extern LcInterface<IUiHost> g_ui_host;
+
+// GkcGui.h 中最薄的宿主包装
+class GuiHelper {
+    static int  Loop()  noexcept;
+    static void Quit()  noexcept;
 };
 
-// 窗口类型
-enum {
-    UW_TYPE_TOPLEVEL = 0,  // 顶层窗口
-    UW_TYPE_DIALOG,        // 对话框
-    UW_TYPE_POPUP          // 弹出窗口
+template <class T>
+class WorkImpl {
+    void PostWork() noexcept;
+};
+
+template <class T>
+class TimerImpl {
+    uintptr AddTimer(int iPeriod) noexcept;
+    void RemoveTimer(uintptr id) noexcept;
 };
 ```
 
-**接口透明化原理**：业务逻辑（.so/.dll 插件）仅调用 IUiHost 接口进行绑定、渲染相关的操作。当运行在本地模式时，IUiHost 直接驱动本地图形库（如 GTK/Win32）；当运行在远程模式时，AppHost 实现的 IUiHost 将渲染结果写入内存像素缓冲区，再通过协议传输至客户端。业务代码无需任何修改。
+**窗口 UI 消息**：通过 `UiMessageHandler` 回调接收，消息类型：
+`UI_MESSAGE_DRAW`、`UI_MESSAGE_CLOSE`、`UI_MESSAGE_MOUSE`、`UI_MESSAGE_KEYBOARD`、`UI_MESSAGE_TEXT`。
 
-### 5.2 IGuiApplication 接口
+业务代码通常继承 `ToplevelImpl<T>` 并重写对应的 `DoDraw / DoMouse / DoKeyboard / DoClose` 方法，GKC 内部自动注册回调并分发。
+
+**IUiHost 是纯接口，不是平台代码**
+
+`IUiHost` 本身只是一组函数指针的结构体，不绑定任何平台。它有两套具体实现，
+分别供 Client 和 AppHost 使用：
+
+| | Client | AppHost |
+|---|---|---|
+| 谁提供 IUiHost | GKC 运行时（已实现好） | 你自己写的 `ui_host_impl` |
+| `CreateToplevel` | 创建真实 Wayland/Win32 窗口 | 分配像素缓冲区，创建假窗口结构体 |
+| `Loop` | 进入真实 OS 事件循环 | 等待 IoPool 事件或退出信号 |
+| `PostWork` | 向真实 UI 线程投递任务 | 向主线程消息队列投递任务 |
+| 像素去哪里 | Wayland/Win32 合成器 → 屏幕 | 截获 → 打包 PIXEL_DATA → 网络 |
+| 事件从哪来 | OS 鼠标/键盘 | 网络 MOUSE_EVENT/KEYBOARD_EVENT |
+
+**接口透明化原理**：业务 `.so` 插件只调用 `IUiHost` 接口写像素和接收事件，
+完全不知道底层是真实屏幕还是网络传输：
+
+```
+插件调用:  host.CreateToplevel(800, 600)  →  不管真假
+          window.DoDraw → 写像素          →  不管谁消费
+          window.DoMouse → 处理坐标       →  不管哪来的
+
+Client 里: 像素 → Wayland/Win32 → 屏幕
+AppHost 里: 像素 → ui_host_impl → 截获 → 发网络
+```
+
+### 5.2 SA_UIMain 插件接口（GKC 标准）
+
+`.so` 插件的入口约定，AppHost 通过 `dlsym("sa_ui_main")` 加载：
 
 ```cpp
-// 业务应用接口
-class IGuiApplication {
-public:
-    virtual bool Initialize(IUiHost* pHost) noexcept = 0;  // 初始化，注入 IUiHost
-    virtual int  Run()                      noexcept = 0;  // 运行业务逻辑
-    virtual void Cleanup()                  noexcept = 0;  // 清理资源
+struct SA_UIMain {
+    // AppHost 调用此函数，传入 IUiHost 接口和启动参数
+    int (*Exec)(const GKC::LcInterface<GKC::IUiHost>& lcHost,
+                const GKC::ConstArray<GKC::ConstStringS>& args) noexcept;
 };
+
+extern "C" GKC::SA_UIMain* sa_ui_main();  // 插件必须以 C 链接导出此符号
 ```
 
 ### 5.3 UI 基础类型
@@ -437,21 +496,29 @@ struct DirtyRectData {
 };
 ```
 
-### 5.6 输入事件
+### 5.6 输入事件（INPUT_EVENT 子类型）
+
+鼠标与键盘共用 `CmdType::INPUT_EVENT = 0x20`，Body 首字节 `eventType` 决定后续格式：
 
 ```cpp
-struct MouseEvent {
-    uint8_t   eventType;    // MOVE/LEFT_DOWN/LEFT_UP/RIGHT_DOWN/RIGHT_UP/SCROLL
-    int32_t   x, y;         // 坐标
-    uint64_t  timestamp;    // 时间戳（微秒）
+// 鼠标事件 Body（eventType = 0x01~0x06），总计 13 字节
+struct MouseEventBody {
+    uint8_t   event_type;  // 0x01=MOVE, 0x02=LEFT_DOWN, 0x03=LEFT_UP,
+                           // 0x04=RIGHT_DOWN, 0x05=RIGHT_UP, 0x06=SCROLL
+    int32_t   x;           // 大端序，相对窗口左上角
+    int32_t   y;           // 大端序；SCROLL 时 y 为滚动增量
+    uint64_t  timestamp;   // 大端序，微秒
 };
 
-struct KeyboardEvent {
-    uint16_t  keyCode;      // 按键码
-    uint8_t   isPressed;    // 1=按下, 0=释放
-    uint64_t  timestamp;    // 时间戳（微秒）
+// 键盘事件 Body（eventType = 0x10~0x11），总计 11 字节
+struct KeyboardEventBody {
+    uint8_t   event_type;  // 0x10=KEY_DOWN, 0x11=KEY_UP
+    uint16_t  key_code;    // 大端序，直接使用 GKC KB_* 枚举值
+    uint64_t  timestamp;   // 大端序，微秒
 };
 ```
+
+> Client 侧直接从 GKC 回调填入：`key_code = pKb->btKey`，无需额外键码映射。
 
 ---
 
@@ -492,83 +559,192 @@ Gateway 是系统的中枢节点，职责远超简单转发，具备以下核心
 
 **目录**：`src/apphost/`
 
-AppHost 是服务端的核心执行单元，负责加载业务插件、执行渲染、检测差分并发送像素数据。
+AppHost 是服务端的核心执行单元，负责加载业务插件并提供假的 `IUiHost`，拦截插件的像素输出发往网络，同时把网络输入事件注入给插件。
 
 #### 启动流程
 
 ```
 1. 由 Gateway 通过 fork/exec 拉起
 2. 通过 dlopen() 加载指定的业务 .so 插件
-3. 通过 dlsym() 解析 IGuiApplication 入口符号
-4. 创建 IUiHost 实现实例，注入业务逻辑
-5. 初始化虚拟像素缓冲区
-6. 启动渲染循环与差分检测
-7. 建立与 Gateway 的 TCP 连接
+3. 通过 dlsym("sa_ui_main") 解析插件入口
+4. 创建 ui_host_impl（假的 IUiHost），拦截 DoDraw 输出
+5. 建立与 Gateway 的 TCP 连接（IoPool StartConnect）
+6. 调用插件 Exec(ui_host_impl, args)，进入 GuiHelper::Loop()
 ```
 
-#### 像素差分传输流程
+#### 像素传输流程（rcPaint 直接传输，无逐帧比对）
+
+GKC 的 `DoDraw(pDraw)` 回调天然携带脏矩形 `pDraw->rcPaint`，无需保存上一帧做像素比对：
 
 ```
-业务逻辑调用 IUiHost 接口
+GKC 触发 DoDraw(pDraw)
+    pDraw->rcPaint  = 本次脏矩形（GKC 自维护，等于触发重绘的区域）
+    pDraw->pBuffer  = 整窗口像素缓冲区
     ↓
-AppHost 在本地完成真实渲染 → 写入内存像素缓冲区（当前帧）
+ui_host_impl 拦截：
+    pixel_capture(pDraw->pBuffer, pDraw->iWidth, pDraw->rcPaint)
+        → 裁出 rcPaint 区域的 ARGB 字节
     ↓
-逐帧差分检测：对比当前帧与上一帧 → 定位脏矩形区域
+WorkPool 快速池：异步打包 PIXEL_DATA
+    [frameSeq(4)][rcLeft(4)][rcTop(4)][rcRight(4)][rcBottom(4)][dataLen(4)][pixels...]
     ↓
-提取脏矩形内的像素数据 → 压缩
-    ↓
-封装为 DIRTY_RECT 协议包（含帧序列号、矩形坐标、像素数据）
-    ↓
-通过 TCP 发送至 Gateway → 路由到对应 Client
+IoPool BeginInput/EndInput → Gateway → Client
 ```
 
-#### 接收处理
+> **不存在** `DirtyRectDetector`（逐帧像素比对）。脏矩形职责由 GKC 的 `DoDraw` 回调机制承担。
 
-- 收到 `MOUSE_EVENT`：转换为业务逻辑可识别的输入事件，注入 IUiHost 事件队列
-- 收到 `KEYBOARD_EVENT`：同上，支持多键组合与拖拽等复杂操作
-- 收到 `APP_EXIT`：清理资源，退出进程
+#### 输入事件接收（PostWork 模式）
+
+IoPool 线程收到输入事件后，**必须通过 PostWork 投递到主线程**再注入插件，不能跨线程直接操作：
+
+```
+IoPool 线程
+  IO_TYPE_RECEIVED → MessageHandler.feed()
+    MOUSE_EVENT 处理器 → 反序列化 → PostWork(inject_mouse, new UiMessageMouse)
+    KEYBOARD_EVENT 处理器 → 反序列化 → PostWork(inject_keyboard, new UiMessageKeyboard)
+
+主线程（PostWork 回调）
+  inject_mouse → ui_host_impl.dispatch_mouse() → 插件 DoMouse()
+  inject_keyboard → ui_host_impl.dispatch_keyboard() → 插件 DoKeyboard()
+```
+
+#### ui_host_impl 详解：假的 IUiHost
+
+`ui_host_impl` 是 AppHost 的核心设计，它实现 `IUiHost` 接口但不触及任何真实 OS/GUI API。
+它有**两个方向**的职责：
+
+**方向 1：插件 → 网络（像素输出）**
+
+插件写像素时，`ui_host_impl` 拦截并发往网络：
+
+```
+插件 DoDraw(pDraw)
+    └─ 向 pDraw->pBuffer 写像素
+ui_host_impl 主动调用存储的 handler.Process(ctx, UI_MESSAGE_DRAW, &drawInfo)
+    └─ pDraw->rcPaint  = ui_host_impl 传入的脏矩形
+    └─ pDraw->pBuffer  = ui_host_impl 持有的像素缓冲区
+    └─ 插件把像素写进来
+ui_host_impl 捕获像素
+    └─ pixel_capture(pBuffer, width, rcPaint) → 裁出 ARGB 字节块
+    └─ WorkPool → 打包 PIXEL_DATA → IoPool → Gateway → Client
+```
+
+**方向 2：网络 → 插件（事件注入）**
+
+网络收到输入事件时，`ui_host_impl` 把它转成 UI 消息注入插件：
+
+```
+IoPool 线程收到 MOUSE_EVENT
+    └─ MessageHandler 分发 → 反序列化 Body → UiMessageMouse
+    └─ PostWork(inject_mouse, pMouse)          ← 跨线程投递
+
+主线程（PostWork 回调）
+    └─ ui_host_impl.dispatch_mouse(pMouse)
+        └─ 构造 ui_message_mouse
+        └─ handler.Process(ctx, UI_MESSAGE_MOUSE, &uiMouse)
+            └─ 插件的 DoMouse() 被调用，坐标正确
+```
+
+键盘事件同理：`KEYBOARD_EVENT → dispatch_keyboard() → UI_MESSAGE_KEYBOARD → DoKeyboard()`。
+
+**ui_host_impl 需要存储什么**
+
+```cpp
+class UiHostImpl {
+    // 假窗口的状态
+    struct VirtualWindow {
+        ui_message_handler handler;   // 插件通过 SetMessageHandler 注册的回调
+        void*              ctx;       // 对应的 pContext
+        uint8_t*           pixel_buf; // 虚拟像素缓冲区（代替 Wayland shm）
+        int                width, height;
+    };
+    VirtualWindow  window_;
+
+    // 与 IoPool 共享的连接，用于发送 PIXEL_DATA
+    uintptr        gateway_conn_;
+};
+```
+
+`SetMessageHandler` 由插件调用（通常通过 `WindowImpl<T>::Create()` 内部触发），
+`ui_host_impl` 只是把 `handler` 和 `ctx` 存下来。之后：
+- **注入事件时**：调用 `window_.handler.Process(window_.ctx, UI_MESSAGE_MOUSE/KEYBOARD, ...)`
+- **触发重绘时**：调用 `window_.handler.Process(window_.ctx, UI_MESSAGE_DRAW, &drawInfo)`，
+  `drawInfo.pBuffer = window_.pixel_buf_`，插件写完像素后截获并发送
+
+---
 
 ### 6.3 Client（客户端）
 
-**目录**：`src/client/`
+**目录**：`src/client/`（通用插件加载器）+ `plugins/client_viewer/`（查看器 UI 插件）
 
-客户端基于 **FLTK (Fast Light Toolkit)** 图形库构建，负责像素重构与输入采集。
+Client 与 AppHost **完全对称**：`src/client/` 是通用插件加载器可执行程序，实际的查看器 UI 逻辑在 `plugins/client_viewer/` 插件中，通过 `dlopen`（Linux）/ `LoadLibrary`（Windows）动态加载。
 
-#### 启动流程
+#### Client 可执行程序职责
 
-```
-1. 初始化 FLTK 窗口
-2. 建立与 Gateway 的 TCP 连接
-3. 发送 SPAWN_APP 请求
-4. 收到 SESSION_ACK，获得 Session ID
-5. 进入主事件循环
-```
+- 解析命令行参数（`--plugin`、`--gateway-host`、`--gateway-port`）
+- 加载 `.so`/`.dll` 插件，调用 `sa_ui_main()` 的 `Exec(real_gkc_ui_host, args)`
+- 提供 `PixelRenderer`（线程安全像素缓冲区）供插件使用
 
-#### 像素重构流程
+#### client_viewer 插件启动流程
 
 ```
-从 Gateway 接收 DIRTY_RECT 数据包
+Exec(real_gkc_ui_host, args)
     ↓
-解析帧序列号、脏矩形坐标与像素数据
+创建 ViewerWindow（ToplevelImpl 子类）
     ↓
-（可选）丢弃过期帧的脏矩形（帧序列号过时）
+IoPool StartConnect → Gateway
     ↓
-解压像素数据
+MessageHandler 注册：SESSION_ACK / PIXEL_DATA / ERROR_RESP 处理器
     ↓
-通过 BitBlt（内存贴图）直接写入窗口对应区域
+发送 SPAWN_APP（携带要启动的 AppHost 插件名）
     ↓
-触发局部重绘，完成界面实时重构
+ViewerWindow.Show(true) + GuiHelper::Loop()
 ```
 
-> 客户端**无需任何本地绘图逻辑**，仅做像素搬运。
+#### 像素重构流程（插件内）
 
-#### 输入事件采集
+```
+IoPool 线程收到 PIXEL_DATA
+    → MessageHandler.feed() → PIXEL_DATA 处理器
+        → PixelRenderer.apply_dirty_rect(rcPaint, pixels) [mutex 保护]
+        → PostWork() 向主线程投递
 
-- 捕获 Raw Input 原始鼠标/键盘事件
-- 标准化封装（坐标偏移、按键码、时间戳）
-- 附加 Session ID 后发送至 Gateway 透传
+主线程 DoDraw(pDraw) 回调
+    → PixelRenderer.blit(pDraw->pBuffer, pDraw->iWidth, pDraw->rcPaint)
+    （只做 memcpy，无本地绘图逻辑）
+```
 
-### 6.4 网络传输层
+#### 输入事件采集（插件内）
+
+- `DoMouse(pMouse)`：直接用 `pMouse->uEvent`、`x`、`y` 打包 MOUSE_EVENT，经 IoPool 发出
+- `DoKeyboard(pKb)`：直接用 `pKb->btKey`（`KB_*`）、`pKb->btState`（`KB_STATE_*`）打包，**无需键码映射**
+
+### 6.4 GKC 异步回调范式
+
+GKC 的整个事件系统基于**回调函数 + 事件驱动**，全面异步，无任何阻塞调用：
+
+| 回调类型 | 触发线程 | 签名 | 用途 |
+|---------|---------|------|------|
+| `_IoFunc::Exec` | IoPool 内部线程 | `int(void* pCtx, int iType, uintptr uParam)` | 网络事件（收包、连接、断开） |
+| `UiMessageHandler::Process` | 主线程 | `void(void* pCtx, uint uMsg, uintptr uParam)` | UI 事件（绘制、鼠标、键盘） |
+| `WorkProc::Exec` | WorkPool 线程 | `void(void* pCtx)` | CPU 任务（pixel_capture 打包、像素解压缩） |
+
+**跨线程协作**：IoPool/WorkPool 线程完成数据处理后，通过 `g_ui_host.GetFunc()->PostWork()`，
+或对象自身继承 `WorkImpl<T>` / `TimerImpl<T>` 这两个包装类，将任务安全投递到主线程，避免竞争条件。
+
+**典型路径（Client 收到像素包）：**
+```
+IoPool 线程
+  IO_TYPE_RECEIVED 触发 _IoFunc::Exec
+    → MessageParser.Feed() → next_packet() 得到完整协议包
+    → 写入 PixelRenderer（mutex 保护）
+    → PostWork() 投递到主线程
+主线程
+  WorkImpl::DoWork() 执行
+    → DoDraw() 回调：把像素 memcpy 到 pDraw->pBuffer
+```
+
+### 6.5 网络传输层
 
 网络 I/O 直接使用 **GKC `IoPool`**（`GKC/RT/GkcSys/public/_GkcSys.h`），不设独立的 `src/network/` 模块。
 
@@ -578,7 +754,7 @@ AppHost 在本地完成真实渲染 → 写入内存像素缓冲区（当前帧�
 
 各组件用法：Gateway 调用 `StartListen` 监听客户端并 `StartConnect` 对接 AppHost；AppHost / Client 均调用 `StartConnect` 连接 Gateway。
 
-### 6.5 协议层
+### 6.6 协议层
 
 **目录**：`src/protocol/`
 
@@ -592,31 +768,93 @@ AppHost 在本地完成真实渲染 → 写入内存像素缓冲区（当前帧�
 
 ## 7. 关键算法与机制
 
-### 7.1 脏矩形差分检测
+### 7.1 脏矩形传输（GKC DoDraw 回调驱动）
 
-AppHost 维护两帧像素缓冲区（当前帧与前一帧），逐帧对比定位变化区域：
+AppHost **不做逐帧像素比对**。脏矩形由 GKC 的 `DoDraw` 回调机制天然提供：
 
 ```
-1. 业务逻辑渲染完成 → 当前帧写入缓冲区 A
-2. 逐行扫描对比缓冲区 A 与缓冲区 B（前一帧）
-3. 记录所有发生变化的像素坐标
-4. 将变化像素聚合为最小外接矩形（脏矩形）
-5. 可进一步拆分为多个不相交的脏矩形以减少冗余传输
-6. 提取脏矩形内像素数据 → 压缩 → 封包发送
-7. 交换缓冲区：A → B，准备下一帧
+事件触发（鼠标点击 / 键盘输入 / 计时器等）
+    ↓ GKC 内部标记对应区域 damage
+    ↓ GKC 调用 DoDraw(pDraw)
+        pDraw->rcPaint = 本次需重绘的最小区域
+
+ui_host_impl 拦截 DoDraw：
+    pixel_capture(pDraw->pBuffer, pDraw->iWidth, pDraw->rcPaint)
+        → 按 rcPaint 坐标裁出 ARGB 字节块
+    ↓
+WorkPool 快速池：打包 PIXEL_DATA，IoPool 发往 Gateway → Client
 ```
 
-**优势**：相较于全量位图/视频流传输（如 RDP/VNC），仅传输实际变化的像素区域，在界面变化较少时（如文本编辑、表单操作）可将带宽降低一个数量级。
+脏矩形的精度由插件自身的 `DoDraw` 实现决定——插件只在 `rcPaint` 范围内写像素，天然形成最小更新区域。在千兆内网带宽下，即使偶尔 rcPaint 覆盖较大区域，传输代价也可接受。
 
-### 7.2 帧序列号与选择性丢弃
+### 7.2 per-connection 上下文设计（ConnContext + free_list + 自旋锁）
 
-每个 DIRTY_RECT 包携带帧序列号（frameSeq），客户端据此处理：
+IoPool 不管理上下文对象的生命周期，调用者必须自行分配和释放。三个组件（Gateway、AppHost、Client）统一采用以下设计模式：
 
-- 正常情况：按序重绘
-- 网络拥塞/丢包：如果收到更新帧的脏矩形，可安全丢弃旧帧的待处理矩形（因为新帧已覆盖该区域）
-- 时间戳同步：输入事件携带时间戳，用于服务端精确回放
+#### 结构布局
 
-### 7.3 动态进程调度
+```
+ConnContext : public node_base
+├── uintptr      id_            // IoPool 返回的连接句柄，用于 BeginInput/DisableHandle
+├── ConnContext* next_active_   // 活跃连接的侵入式单链表（用于关闭时清理）
+├── _IoFunc      io_func_       // 嵌入式回调，Exec 指向静态函数，this 作为 pIoContext
+├── MessageParser/MessageHandler parser_  // 粘包解析器，每连接独立状态
+└── Impl*        server_        // 反向指针，用于访问 IoPool、连接池等共享资源
+```
+
+- 继承 `node_base`（`GkcDef.h`）：提供 `m_pNext` 字段，供 `free_list<ConnContext>` 链接空闲节点
+- 嵌入 `_IoFunc io_func_`：每个连接拥有独立的回调指针，在 `IO_TYPE_ACCEPT_INIT` 时通过 `SetHandleFunc` 绑定到本连接，`pIoContext` 设为 `this`
+
+#### 内存管理
+
+```cpp
+free_list<ConnContext> conn_pool_;    // 预分配节点池，无堆分配
+ConnContext*           active_head_;  // 活跃节点的侵入式单链表
+volatile int           conn_lock_;   // 原子自旋锁（0=未持有，1=持有）
+```
+
+分配顺序（严格遵守，参照 `node_helper::ConstructNode`）：
+```
+FetchFreeNode(conn)    → 查看空闲链表头，conn 指向该节点，但节点尚未摘除
+call_constructor(*conn) → 就地构造（placement new），重置所有字段
+PickFreeNode()          → 将节点从空闲链表摘除（只有构造成功才执行）
+```
+若 `call_constructor` 失败，`PickFreeNode` 不会执行，节点留在空闲链表头，不会丢失。
+
+释放顺序：
+```
+call_destructor(*conn)  → 析构对象
+lock 保护:
+    从 active_head_ 链表摘除
+    PutFreeNode(conn)    → 将节点头插回空闲链表
+```
+
+#### 关闭时清理
+
+`_IoPool_Disable()` 不保证在线程退出之前为所有活跃连接触发 `BEFORE_CLOSE`。
+在 `stop()` 调用 `_IoPool_Disable()` 后，需遍历 `active_head_` 链表，
+对每个残留节点调用 `call_destructor + PutFreeNode`，确保无泄漏。
+
+#### 三个组件均遵循此模式
+
+| 组件 | ConnContext 类型 | 额外字段 |
+|------|----------------|---------|
+| AppHost | `ConnContext` | `MessageParser parser_` |
+| Gateway（Client 侧） | `ClientSession` | `session_id_`、`apphost_conn_` |
+| Gateway（AppHost 侧） | `AppHostSession` | `session_id_`、`client_conn_` |
+| Client | `ClientConn` | `MessageParser parser_`、`PixelRenderer* renderer_` |
+
+---
+
+### 7.4 帧序列号
+
+每个 PIXEL_DATA 包携带 `frameSeq`，供 Client 处理乱序/重复：
+
+- 正常情况：按序更新对应区域
+- 收到旧序列号的包（网络重传）：可选择丢弃（该区域已被更新版本覆盖）
+- 输入事件携带 `timestamp`，AppHost 可据此做事件顺序排队
+
+### 7.5 动态进程调度
 
 Gateway 的进程调度流程：
 
@@ -673,10 +911,9 @@ fork() → 子进程
 
 - C++17 编译器（GCC / Clang / MSVC）
 - Bazel 7.4.1
-- FLTK（客户端图形库）
-- GKC 框架（git submodule，自动拉取）
-- Linux：POSIX threads、epoll、dlopen
-- Windows：Winsock2、LoadLibrary
+- GKC 框架（git submodule）：三个组件（Client / Gateway / AppHost）全部依赖
+  - Linux：GKC 内部使用 epoll、Wayland、POSIX threads、dlopen
+  - Windows：GKC 内部使用 IOCP、Win32 GDI
 
 ### 构建
 
@@ -684,24 +921,31 @@ fork() → 子进程
 # 构建全部目标
 bazel build //...
 
-# 单独构建
+# 单独构建可执行程序
 bazel build //src/gateway:gateway
 bazel build //src/apphost:apphost
 bazel build //src/client:client
+
+# 构建插件
+bazel build //plugins/demo_app:demo_app        # → libdemo_app.so
+bazel build //plugins/client_viewer:client_viewer  # → libclient_viewer.so / client_viewer.dll
 ```
 
 ### 运行顺序
 
 ```bash
-# 1. 启动网关（必须最先启动）
-./bazel-bin/src/gateway/gateway
+# 1. 启动网关
+./bazel-bin/src/gateway/gateway --client-port=19000 --apphost-port=19001
 
-# 2. 客户端连接网关，发送 SPAWN_APP 请求后
-#    网关自动拉起 AppHost 进程，无需手动启动
-./bazel-bin/src/client/client
+# 2. 启动客户端（指定插件和 Gateway 地址）
+#    Gateway 会自动 fork/exec AppHost，无需手动启动
+./bazel-bin/src/client/client \
+  --plugin=./bazel-bin/plugins/client_viewer/libclient_viewer.so \
+  --gateway-host=127.0.0.1 \
+  --gateway-port=19000
 ```
 
-> AppHost 进程由 Gateway 动态管理，无需手动启动。
+> AppHost 由 Gateway 动态拉起，命令行参数由 Gateway 传入（包括 `--plugin=libdemo_app.so`）。
 
 ---
 
@@ -713,11 +957,14 @@ bazel build //src/client:client
 |------|------|
 | **应用级虚拟化** | 以独立应用为粒度，区别于 RDP/VNC 的桌面镜像模式 |
 | **IUiHost 接口解耦** | 业务逻辑与渲染引擎彻底分离，支持本地/远程模式无缝切换 |
-| **像素差分传输** | 脏矩形检测 + 压缩，大幅降低带宽消耗 |
+| **GKC rcPaint 驱动传输** | 脏矩形由 GKC DoDraw 回调天然提供，无逐帧比对，传输最小更新区域 |
+| **双端插件对称** | AppHost 和 Client 均为通用插件加载器，业务逻辑在 .so/.dll 中，可热替换 |
+| **MessageHandler 分发** | IoPool 回调内统一通过 MessageHandler 按 CmdType 分发，三个组件共用模式 |
 | **智能网关调度** | Session 管理 + 动态路由 + 进程生命周期，支持水平扩展 |
 | **TCP 可靠传输** | 自定义二进制协议，状态机解包，解决粘包/半包问题 |
 | **进程级隔离** | fork/exec 独立进程空间，单点故障不影响全局 |
-| **跨平台支持** | 传输层封装 Windows/Linux 差异，GKC 框架统一 API |
+| **全 GKC 统一** | Client / Gateway / AppHost 三个组件均基于 GKC（IoPool + WorkPool + GkcGui），无 FLTK 依赖，跨 Linux/Windows |
+| **回调异步范式** | _IoFunc / UiMessageHandler / WorkProc 三套回调全面异步，PostWork 线程安全跨线程调度 |
 | **帧序列号机制** | 支持客户端在弱网下选择性丢弃过期帧 |
 
 ### 已知局限
@@ -728,3 +975,275 @@ bazel build //src/client:client
 | 音频传输 | 协议暂不支持音频流传输 |
 | 多显示器 | 暂不支持多显示器场景 |
 | GPU 加速 | 服务端渲染未利用 GPU 硬件加速 |
+
+---
+
+## 11. 端到端交互 Demo
+
+**场景**：用户在 Client 窗口点击鼠标 → 触发服务端 AppHost 重绘 → 像素回传至 Client 并显示。
+
+此 Demo 完整串联五个关键组件：**GKC GUI API、MessageParser、MessageHandler、IUiHost、ui_host_impl**。
+
+### 11.1 全链路时序图
+
+```
+Client 主线程        Client IoPool 线程    Gateway IoPool 线程    AppHost IoPool 线程    AppHost 主线程
+      │                       │                      │                      │                    │
+① DoMouse(pMouse)             │                      │                      │                    │
+  打包 INPUT_EVENT             │                      │                      │                    │
+  BeginInput/EndInput ────────►│                      │                      │                    │
+                               │──IO_TYPE_RECEIVED────►                      │                    │
+② Gateway:                     │               MessageParser.feed()          │                    │
+                               │               next_packet(pkt)             │                    │
+                               │               按 SessionId 路由             │                    │
+                               │               BeginInput/EndInput ─────────►│                    │
+                               │                      │               IO_TYPE_RECEIVED            │
+③ AppHost:                     │                      │          MessageParser.feed()             │
+                               │                      │          next_packet(pkt)                │
+                               │                      │          MessageHandler 分发              │
+                               │                      │          on_input_event() ───────────────►│
+                               │                      │                      │   ④ PostWork
+                               │                      │                      │      dispatch_mouse()
+                               │                      │                      │      IUiHost.Process(MOUSE)
+                               │                      │                      │      插件 DoMouse()
+                               │                      │                      │      GKC → DoDraw(pDraw)
+                               │                      │                      │◄─ ⑤ pixel_capture(rcPaint)
+                               │                      │                      │      打包 PIXEL_DATA
+                               │                      │                      │      BeginInput/EndInput
+                               │                      │◄─────────────────────│
+⑥ Gateway:                     │               IO_TYPE_RECEIVED              │
+                               │               MessageParser.feed()          │
+                               │               next_packet(pkt)             │
+                               │               按 SessionId 路由             │
+                               │◄─────────────────────                      │
+⑦ IO_TYPE_RECEIVED             │                      │                      │
+  MessageParser.feed()         │                      │                      │
+  next_packet(pkt)             │                      │                      │
+  MessageHandler 分发          │                      │                      │
+  on_pixel_data()              │                      │                      │
+  PixelRenderer.apply()        │                      │                      │
+  PostWork() ──────────────────►（通知主线程重绘）       │                      │
+      │                       │                      │                      │                    │
+⑧ DoDraw(pDraw)               │                      │                      │                    │
+  PixelRenderer.blit() → 屏幕  │                      │                      │                    │
+```
+
+---
+
+### 11.2 各组件在链路中的角色
+
+#### ① GKC GUI API — Client 采集鼠标事件
+
+GKC 的 `ToplevelImpl<ClientWindow>` 在用户点击时自动调用 `DoMouse`，
+这是 **GKC GUI API** 的标准回调机制（底层是 `UiMessageHandler`）。
+开发者只需继承 `ToplevelImpl<T>` 并实现 `DoMouse`，GKC 负责平台事件适配（Wayland / Win32）：
+
+```cpp
+// plugins/client_viewer/client_viewer.cpp
+void DoMouse(GKC::UiMessageMouse* pMouse) noexcept {
+    // pMouse 由 GKC 从 OS 鼠标事件填充，开发者无需任何平台代码
+    uint8_t buf[13];
+    buf[0] = (pMouse->uEvent == MOUSE_EVENT_DOWN) ? 0x02 : 0x03;  // eventType
+    write_be32(buf + 1, static_cast<uint32_t>(pMouse->x));
+    write_be32(buf + 5, static_cast<uint32_t>(pMouse->y));
+    write_be64(buf + 9, timestamp_us());
+    // 通过 IoPool BeginInput/EndInput 发送 INPUT_EVENT（CmdType=0x20）
+    send_packet(conn_id_, CmdType::INPUT_EVENT, buf, sizeof(buf));
+}
+```
+
+**GKC GUI API 的作用**：`ToplevelImpl<T>` 封装了 `UI_MESSAGE_MOUSE` 的注册与分发，
+`DoMouse` / `DoDraw` / `DoKeyboard` 是固定签名的虚回调，GKC 内部通过 `UiMessageHandler::Process`
+分发所有 UI 消息，开发者只需实现这三个方法。
+
+---
+
+#### ② Gateway — 纯路由，只用 MessageParser 定帧
+
+Gateway 收到 Client 的字节流后，唯一目的是找到完整协议包并按 SessionId 转发。
+它 **不需要 MessageHandler**（不处理业务语义），只需 `MessageParser`：
+
+```cpp
+// src/gateway/gateway.cpp — ClientSession 的 IO_TYPE_RECEIVED 处理
+void on_received(ClientSession* s, const uint8_t* data, size_t len) {
+    s->parser_.feed(data, len);              // MessageParser: 字节流 → 协议帧
+    Packet pkt;
+    while (s->parser_.next_packet(pkt) == ParseResult::OK) {
+        // 按 SessionId 查找目标 AppHost 连接句柄
+        uintptr apphost_id = session_mgr_.find_apphost(pkt.header.session_id);
+        if (apphost_id == 0) continue;
+        forward_raw(apphost_id, pkt);        // 原包转发，不解析 Body
+    }
+}
+```
+
+**MessageParser 的作用**：TCP 是流式协议，单次 `IO_TYPE_RECEIVED` 可能只收到半个 Header，
+也可能包含多个完整包。`MessageParser` 内部状态机负责：
+1. `READ_HEADER`：累积到够 13 字节
+2. `VALIDATE_MAGIC`：校验 `0xBEEF`，非法则丢弃并重新同步
+3. `READ_BODY`：按 `body_length` 累积 Body
+
+`feed()` 推入原始字节，`next_packet()` 以 Pull 方式拉出完整帧，调用者无需关心边界。
+
+---
+
+#### ③ AppHost — MessageParser + MessageHandler 双层解析
+
+AppHost 不仅要定帧，还要按 `CmdType` 分发到不同的业务处理器。
+因此在 `MessageParser` 之上再包一层 **MessageHandler**：
+
+```cpp
+// src/apphost/apphost.cpp — 初始化时注册处理器
+void Impl::register_handlers() {
+    handler_.on(CmdType::INPUT_EVENT,   [this](const Packet& p){ on_input_event(p); });
+    handler_.on(CmdType::HEARTBEAT,     [this](const Packet& p){ on_heartbeat(p);   });
+    handler_.on(CmdType::CLOSE_SESSION, [this](const Packet& p){ on_close(p);       });
+}
+
+// IO_TYPE_RECEIVED 回调只需一行
+void on_received(ConnContext* conn, const uint8_t* data, size_t len) {
+    conn->handler_.feed(data, len);  // MessageHandler 内部调用 MessageParser，再自动 dispatch
+}
+```
+
+**MessageHandler 的作用**：是 `MessageParser` 的上层路由器，
+维护 `unordered_map<uint8_t, HandlerFn>`（`CmdType` → 处理函数）。
+`feed()` 先驱动 `MessageParser` 定帧，帧完整后立即按 `cmd_type` 查表并调用对应处理器。
+调用者只需 `handler_.on(CmdType::X, callback)` 注册，之后 `feed()` 一行搞定全部分发。
+
+---
+
+#### ④ AppHost 主线程 — IUiHost::PostWork + ui_host_impl 注入事件
+
+AppHost 的 IoPool 线程不能直接操作插件（插件在主线程），
+必须通过 **IUiHost::PostWork** 跨线程投递：
+
+```cpp
+// src/apphost/apphost.cpp — INPUT_EVENT 处理器（IoPool 线程内执行）
+void Impl::on_input_event(const Packet& pkt) {
+    uint8_t event_type = pkt.body[0];
+
+    if (event_type >= 0x01 && event_type <= 0x06) {        // 鼠标事件
+        auto* msg = new UiMessageMouse{};
+        msg->uEvent = event_type;
+        msg->x      = read_be32(pkt.body.data() + 1);
+        msg->y      = read_be32(pkt.body.data() + 5);
+        // IUiHost::PostWork — 跨线程安全投递到主线程
+        ui_host_.GetFunc()->PostWork(ui_host_.GetContext(), inject_mouse, msg);
+    }
+}
+
+// 主线程执行（PostWork 回调）
+static void inject_mouse(void* ctx) noexcept {
+    auto* msg = static_cast<UiMessageMouse*>(ctx);
+    // ui_host_impl.dispatch_mouse 构造 UI_MESSAGE_MOUSE，
+    // 调用插件注册的 UiMessageHandler.Process
+    ui_host_impl_.dispatch_mouse(msg);
+    delete msg;
+}
+```
+
+**IUiHost 接口的作用**：`PostWork` 是 `IUiHost` 的跨线程调度 API。
+- Client 使用 GKC 真实实现（底层是 eventfd / Win32 PostMessage）
+- AppHost 使用 `ui_host_impl`（假实现，内部维护自己的任务队列）
+
+两者对调用者接口完全相同，插件 `.so` 代码无需关心。
+
+---
+
+#### ⑤ ui_host_impl — 双向粘接层，拦截 DoDraw 捕获像素
+
+插件的 `DoMouse` 修改内部状态后，`ui_host_impl` 主动触发 `DoDraw`，
+这是捕获像素的关键时刻：
+
+```cpp
+// src/apphost/ui_host_impl.cpp
+void UiHostImpl::trigger_draw(ui_rect dirty) noexcept {
+    UiMessageDraw draw_info{};
+    draw_info.pBuffer = window_.pixel_buf;   // 虚拟像素缓冲区（替代真实屏幕）
+    draw_info.iWidth  = window_.width;
+    draw_info.rcPaint = dirty;               // GKC 自维护的脏矩形，直接传入
+
+    // 调用插件注册的 DoDraw：插件向 draw_info.pBuffer 写像素
+    window_.handler.Process(window_.ctx, UI_MESSAGE_DRAW,
+                            reinterpret_cast<uintptr>(&draw_info));
+
+    // 插件写完后，ui_host_impl 截获 rcPaint 区域的 ARGB 字节
+    pixel_capture(draw_info.pBuffer, window_.width, draw_info.rcPaint,
+                  [this](const uint8_t* argb, size_t len, ui_rect rc) {
+                      send_pixel_data(gateway_conn_, session_id_, rc, argb, len);
+                  });
+}
+```
+
+**ui_host_impl 的作用（双向）**：
+- **插件 → 网络**：拦截 `DoDraw`，从 `pDraw->rcPaint` 读脏矩形，裁出像素，打包 `PIXEL_DATA` 发网络
+- **网络 → 插件**：把网络 `INPUT_EVENT` 转成 `UI_MESSAGE_MOUSE/KEYBOARD`，
+  调用插件的 `UiMessageHandler.Process`，触发 `DoMouse` / `DoKeyboard`
+
+插件 `.so`（`demo_app.cpp`）完全不知道底层是真实屏幕还是网络，只按 GKC GUI API 编程。
+
+---
+
+#### ⑥ Gateway — 对称路由 PIXEL_DATA 回 Client
+
+AppHost → Gateway 的路径与步骤 ② 完全对称：Gateway 对 AppHost 连接同样只做
+`MessageParser` 定帧 + SessionId 路由，不解析像素内容。
+
+---
+
+#### ⑦ Client IoPool — MessageParser + MessageHandler 接收 PIXEL_DATA
+
+```cpp
+// plugins/client_viewer/client_viewer.cpp — 初始化时注册
+handler_.on(CmdType::SESSION_ACK, [this](const Packet& p){ on_session_ack(p); });
+handler_.on(CmdType::PIXEL_DATA,  [this](const Packet& p){ on_pixel_data(p);  });
+
+void on_pixel_data(const Packet& pkt) {
+    // 反序列化 PIXEL_DATA Body：
+    // [frameSeq(4)][rectLeft(4)][rectTop(4)][rectRight(4)][rectBottom(4)][dataLen(4)][pixelData...]
+    uint32_t rect_left  = read_be32(pkt.body.data() +  4);
+    uint32_t rect_top   = read_be32(pkt.body.data() +  8);
+    uint32_t rect_right = read_be32(pkt.body.data() + 12);
+    uint32_t rect_bot   = read_be32(pkt.body.data() + 16);
+    uint32_t data_len   = read_be32(pkt.body.data() + 20);
+    const uint8_t* pixels = pkt.body.data() + 24;
+
+    ui_rect rc{(int)rect_left, (int)rect_top, (int)rect_right, (int)rect_bot};
+    renderer_.apply_dirty_rect(rc, pixels, data_len); // ← 写 PixelRenderer（mutex 保护）
+
+    // 通知主线程重绘（GKC GUI API）
+    ui_host_.GetFunc()->PostWork(ui_host_.GetContext(), trigger_redraw, this);
+}
+```
+
+---
+
+#### ⑧ Client 主线程 — DoDraw 贴像素到屏幕
+
+```cpp
+// plugins/client_viewer/client_viewer.cpp
+void DoDraw(GKC::UiMessageDraw* pDraw) noexcept {
+    // GKC GUI API：DoDraw 由 GKC 触发
+    // pDraw->pBuffer = GKC 管理的屏幕共享内存（Wayland wl_shm / Win32 GDI）
+    // pDraw->rcPaint = GKC 告知本次需重绘的区域
+    renderer_.blit(pDraw->pBuffer, pDraw->iWidth, pDraw->rcPaint);
+    // blit 只做 memcpy，把 PixelRenderer 缓冲区对应区域复制进去
+    // GKC 随后将 pDraw->pBuffer 合成到 Wayland / Win32 窗口，用户看到更新
+}
+```
+
+**GKC GUI API 在 Client 侧的作用**：`DoDraw` 只需做 `memcpy`，
+GKC 负责所有窗口合成与刷新细节，Client 插件无任何平台代码。
+
+---
+
+### 11.3 五大组件总结
+
+| 组件 | 所在位置 | 核心职责 |
+|------|---------|---------|
+| **GKC GUI API** (`ToplevelImpl<T>` / `DoDraw` / `DoMouse` / `DoKeyboard`) | client_viewer 插件（Client）；demo_app 插件（AppHost） | 统一抽象 OS GUI 事件（Wayland/Win32），开发者只实现 `DoXxx` 回调，GKC 负责平台适配和 `UiMessageHandler` 注册/分发 |
+| **MessageParser** | 三个组件均有，每个 TCP 连接独立实例 | TCP 字节流 → 完整协议帧：内部状态机（READ_HEADER → VALIDATE_MAGIC → READ_BODY），`feed()` 推入字节，`next_packet()` 拉出帧，解决粘包/半包 |
+| **MessageHandler** | AppHost、Client 有；Gateway 不需要（只做路由） | 协议帧 → 业务回调：包装 `MessageParser`，维护 `CmdType → HandlerFn` 映射，`feed()` 后自动 dispatch，调用者只需 `on(CmdType, fn)` 注册 |
+| **GKC IUiHost** | Client 用 GKC 真实实现；AppHost 用假实现 | GUI 宿主接口（`Loop` / `PostWork` / `CreateToplevel` / `AddTimer`），插件与底层平台的唯一接触点，两端接口相同 |
+| **ui_host_impl**（`IUiHost` 假实现） | AppHost（`src/apphost/ui_host_impl.cpp`） | 双向粘接层：① 插件 `DoDraw` → `pDraw->rcPaint` → `pixel_capture` → `PIXEL_DATA` → 网络；② 网络 `INPUT_EVENT` → `PostWork` → `dispatch_mouse/keyboard` → 插件 `DoMouse/DoKeyboard` |

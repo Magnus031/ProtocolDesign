@@ -18,7 +18,7 @@ ProtocolDesign 是一个基于 TCP 的应用级 UI 虚拟化通信协议系统�
 ```
 Client ──SPAWN_APP──► Gateway ──fork/exec──► AppHost
 Client ◄─SESSION_ACK─ Gateway ◄─TCP连接───── AppHost
-Client ◄─PIXEL_DATA─ Gateway ◄─渲染/差分─── AppHost
+Client ◄─PIXEL_DATA─ Gateway ◄─DoDraw 捕获── AppHost
 Client ──INPUT_EVENT─ Gateway ──路由转发───► AppHost
 ```
 
@@ -365,9 +365,9 @@ Client_Socket  ↔  Session_ID  ↔  AppHost_Socket
 2. **选择性丢弃**：网络拥塞时，如果收到更新的帧（`frameSeq` 更大），可安全丢弃旧帧的待处理矩形
 3. **乱序处理**：允许帧乱序到达，但最终以最新帧为准
 
-### 7.2 脏矩形聚合
+### 7.2 脏矩形来源
 
-AppHost 的差分检测算法将变化像素聚合为最小外接矩形，进一步可拆分为多个不相交矩形以减少传输冗余。
+AppHost 的 `ui_host_impl` 拦截 GKC 的 `DoDraw` 回调，从 `pDraw->rcPaint` 直接读取本次重绘的脏矩形坐标（GKC 框架自行维护），无需逐帧像素差分。每次 `DoDraw` 触发时只传输 `rcPaint` 指定区域的像素数据。
 
 ### 7.3 压缩策略
 
@@ -428,7 +428,7 @@ AppHost 的差分检测算法将变化像素聚合为最小外接矩形，进一
 
 - `src/protocol/protocol.h`：协议头与指令类型定义
 - `src/protocol/protocol.cpp`：序列化/反序列化实现  
-- `src/protocol/message_parser.h`：TCP 粘包状态机（待实现）
+- `src/protocol/message_parser.h`：TCP 粘包状态机（已实现）
 - `src/common/byte_order.h`：字节序转换工具
 
 ### 10.2 测试覆盖

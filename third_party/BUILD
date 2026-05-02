@@ -15,7 +15,9 @@ cmake(
     lib_source = ":gkc_all_srcs",
     out_lib_dir = "main/assemblies",
     out_include_dir = "main/dev/include/GKC",
-    out_shared_libs = ["libGkcSys.so"],
+    # cmake installs libGkcSys.so (SONAME libGkcSys.so.1) and libGkcSys.so.1.
+    # Both must be listed so Bazel includes the versioned file in test runfiles.
+    out_shared_libs = ["libGkcSys.so", "libGkcSys.so.1"],
     visibility = ["//visibility:public"],
 )
 
@@ -28,7 +30,7 @@ cmake(
     lib_source = ":gkc_all_srcs",
     out_lib_dir = "main/assemblies",
     out_include_dir = "main/dev/include/GKC",
-    out_shared_libs = ["libGkcSys.so"],
+    out_shared_libs = ["libGkcSys.so", "libGkcSys.so.1"],
     visibility = ["//visibility:public"],
 )
 

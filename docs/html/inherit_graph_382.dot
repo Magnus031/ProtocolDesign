@@ -1,8 +1,0 @@
-digraph "Graphical Class Hierarchy"
-{
- // LATEX_PDF_SIZE
-  edge [fontname="Helvetica",fontsize="10",labelfontname="Helvetica",labelfontsize="10"];
-  node [fontname="Helvetica",fontsize="10",shape=record];
-  rankdir="LR";
-  Node0 [label="GKC::FixedStringCaseIgnore\lHashTrait\< T \>",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$class_g_k_c_1_1_fixed_string_case_ignore_hash_trait.html",tooltip=" "];
-}

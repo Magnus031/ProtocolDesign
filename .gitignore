@@ -1,11 +1,31 @@
-third_party/GKC/build/
+# Bazel workspace outputs and symlinks
+/bazel-*
+/external
+/compile_commands.json
 
-bazel-*
+# Local tool caches
+/.cache/
+/.codex
+/.claude/
 
-third_party/GKC_BUILD/
+# IDE / editor local state
+/.idea/
+/.vscode/
 
-docs/GKC/
+# Generated documentation
+/docs/html/
 
-docs/plan/
+# Local third-party build outputs
+/third_party/GKC/build/
+/third_party/GKC_BUILD/
 
-CLAUDE.md
+# Generic build outputs
+/build/
+/dist/
+/out/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*~

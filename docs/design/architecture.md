@@ -272,6 +272,7 @@ enum class CmdType : uint8_t {
     HEARTBEAT     = 0x01,  // 心跳包，Body 为空，双向
     SPAWN_APP     = 0x02,  // Client → Gateway：请求启动 AppHost 进程
     SESSION_ACK   = 0x03,  // Gateway → Client：会话建立确认，携带 session_id
+    APPHOST_READY = 0x04,  // AppHost → Gateway：绑定 AppHost 连接到 session_id
 
     // 像素传输
     PIXEL_DATA    = 0x10,  // AppHost → Client：脏矩形像素数据

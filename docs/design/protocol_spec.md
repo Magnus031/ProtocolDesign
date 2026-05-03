@@ -47,6 +47,7 @@ enum class CmdType : uint8_t {
     HEARTBEAT     = 0x01,  // 心跳包，Body 为空
     SPAWN_APP     = 0x02,  // Client → Gateway：请求启动 AppHost
     SESSION_ACK   = 0x03,  // Gateway → Client：分配 Session ID
+    APPHOST_READY = 0x04,  // AppHost → Gateway：绑定 AppHost 连接到 Session ID
     PIXEL_DATA    = 0x10,  // AppHost → Client：脏矩形像素数据
     INPUT_EVENT   = 0x20,  // Client → AppHost：鼠标/键盘事件
     CLOSE_SESSION = 0xFE,  // 任意方向：关闭会话
@@ -100,33 +101,51 @@ buf[5] = 0x04  // 最低有效字节 (LSB)
 ```
 
 - `appNameLength`：应用名长度（字节数），大端序 32 位整数
-- `appName`：应用名称，UTF-8 编码，不含终止符
+- `appName`：逻辑应用名称，UTF-8 编码，不含终止符；不是任意 `.so/.dll` 文件路径
+
+Gateway 必须通过本地 allowlist / 配置表把 `appName` 映射到实际插件路径，例如：
+
+```
+demo_app -> ./plugins/demo_app/libdemo_app.so
+```
+
+Client 不直接传 `plugin_path`，避免请求任意本地文件路径。
 
 **处理流程**：
-1. Gateway 解析 `appName`，检查对应的 `.so/.dll` 插件是否存在
-2. 通过 `fork()` + `exec()` 拉起独立的 AppHost 进程
-3. Gateway 等待 AppHost 建立 TCP 连接
-4. Gateway 分配 Session ID，建立双向路由映射
-5. Gateway 向 Client 返回 `SESSION_ACK`
+1. Gateway 解析 `appName`，检查名称格式和 allowlist 映射
+2. Gateway 分配 Session ID，创建 SPAWNING 状态的会话记录
+3. 通过 `fork()` + `exec()` 拉起独立的 AppHost 进程，并通过启动参数传入 Session ID
+4. Gateway 等待 AppHost 建立 TCP 连接并发送 `APPHOST_READY`
+5. Gateway 建立双向路由映射
+6. Gateway 向 Client 返回 `SESSION_ACK`
 
 ### 3.3 SESSION_ACK (0x03)
 
 **方向**：Gateway → Client  
 **功能**：确认会话建立，返回分配的 Session ID。
 
-**载荷格式**：
-```
-┌──────────────────┐
-│ sessionId        │
-│ (4 bytes BE)     │
-└──────────────────┘
-```
+**载荷格式**：Body 为空，分配的 Session ID 写在 Header 的 `session_id` 字段中。
 
-- `sessionId`：Gateway 分配的会话标识，与 Client 的 TCP socket 绑定
+- `header.session_id`：Gateway 分配的会话标识，与 Client 的 TCP socket 绑定
 
 **后续通信**：Client 与 AppHost 的所有后续消息必须携带此 `sessionId`，Gateway 依此进行路由转发。
 
-### 3.4 PIXEL_DATA (0x10)
+### 3.4 APPHOST_READY (0x04)
+
+**方向**：AppHost → Gateway
+**功能**：声明当前 AppHost TCP 连接属于哪个 Session。
+
+**载荷格式**：Body 为空，`session_id` 写在 Header 中。
+
+- `session_id`：Gateway 分配并通过 AppHost 启动参数传入的会话标识
+
+**处理流程**：
+1. AppHost 进程启动后连接 Gateway 的内部端口
+2. AppHost 发送 `APPHOST_READY`，Header 中携带 `session_id`
+3. Gateway 将当前 AppHost 连接绑定到对应的 `ClientSession`
+4. 绑定完成后，Gateway 才能按 `session_id` 双向转发 `INPUT_EVENT` / `PIXEL_DATA`
+
+### 3.5 PIXEL_DATA (0x10)
 
 **方向**：AppHost → Client  
 **功能**：传输脏矩形区域的像素数据。

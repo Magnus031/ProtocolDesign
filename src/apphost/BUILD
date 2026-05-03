@@ -34,8 +34,13 @@ cc_library(
 cc_binary(
     name = "apphost_bin",
     srcs = ["main.cpp"],
-    deps = [":apphost"],
+    deps = [
+        ":apphost",
+        "//src/protocol:message_parser",
+        "//src/protocol:protocol",
+    ],
     copts = ["-std=c++17"],
+    visibility = ["//visibility:public"],
 )
 
 cc_test(

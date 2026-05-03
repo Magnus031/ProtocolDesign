@@ -1,0 +1,847 @@
+#include "src/gateway/gateway.h"
+#include "src/gateway/process_manager.h"
+#include "src/gateway/session_manager.h"
+#include "src/protocol/message_parser.h"
+#include "src/protocol/protocol.h"
+
+#include "base/GkcDef.h"
+#include "sys/_GkcSys.h"
+
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <condition_variable>
+#include <cstring>
+#include <cstdlib>
+#include <mutex>
+#include <queue>
+#include <string>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+
+namespace {
+
+std::vector<uint8_t> serialize_packet(const Packet& pkt) {
+    std::vector<uint8_t> out(HEADER_SIZE + pkt.body.size());
+    Header hdr = pkt.header;
+    hdr.body_length = static_cast<uint32_t>(pkt.body.size());
+    serialize_header(hdr, out.data());
+    if (!pkt.body.empty())
+        std::memcpy(out.data() + HEADER_SIZE, pkt.body.data(), pkt.body.size());
+    return out;
+}
+
+std::vector<uint8_t> make_packet(CmdType cmd, uint32_t session_id) {
+    Header hdr{};
+    hdr.magic = PROTOCOL_MAGIC;
+    hdr.session_id = session_id;
+    hdr.cmd_type = cmd;
+    hdr.body_length = 0;
+
+    std::vector<uint8_t> out(HEADER_SIZE);
+    serialize_header(hdr, out.data());
+    return out;
+}
+
+std::vector<uint8_t> make_error(uint32_t session_id) {
+    return make_packet(CmdType::ERROR_RESP, session_id);
+}
+
+bool read_be32(const std::vector<uint8_t>& body, size_t offset, uint32_t* out) {
+    if (offset + 4 > body.size())
+        return false;
+    *out = (static_cast<uint32_t>(body[offset]) << 24) |
+           (static_cast<uint32_t>(body[offset + 1]) << 16) |
+           (static_cast<uint32_t>(body[offset + 2]) << 8) |
+            static_cast<uint32_t>(body[offset + 3]);
+    return true;
+}
+
+bool is_valid_app_name(const std::string& name) {
+    if (name.empty() || name.size() > 255)
+        return false;
+    if (name.find("..") != std::string::npos)
+        return false;
+    for (unsigned char ch : name) {
+        if (ch == '/' || ch == '\\')
+            return false;
+        if (!(std::isalnum(ch) || ch == '_' || ch == '-' || ch == '.'))
+            return false;
+    }
+    return true;
+}
+
+bool parse_spawn_app_name(const Packet& pkt, std::string* out) {
+    uint32_t len = 0;
+    if (!read_be32(pkt.body, 0, &len))
+        return false;
+    if (len == 0 || len > 255 || pkt.body.size() != 4u + len)
+        return false;
+    std::string name(reinterpret_cast<const char*>(pkt.body.data() + 4), len);
+    if (!is_valid_app_name(name))
+        return false;
+    *out = std::move(name);
+    return true;
+}
+
+} // namespace
+
+struct Gateway::Impl {
+    struct ClientSession;
+    struct AppHostSession;
+
+    struct ClientSession : public node_base {
+        uintptr id_ = 0;
+        uint64_t generation_ = 0;
+        ClientSession* next_active_ = nullptr;
+        _IoFunc io_func_;
+        MessageParser parser_;
+        uint32_t session_id_ = 0;
+        uintptr apphost_conn_ = 0;
+        std::queue<std::vector<uint8_t>> send_queue_;
+        Impl* server_ = nullptr;
+
+        ClientSession() noexcept { io_func_.Exec = on_client_event; }
+
+        static int on_client_event(void* ctx, int type, uintptr param) noexcept {
+            auto* conn = static_cast<ClientSession*>(ctx);
+            switch (type) {
+            case IO_TYPE_RECEIVED: {
+                auto* info = reinterpret_cast<_IoRecvInfo*>(param);
+                conn->server_->on_client_received(
+                    conn, reinterpret_cast<const uint8_t*>(info->p),
+                    static_cast<size_t>(info->len));
+                break;
+            }
+            case IO_TYPE_SENT:
+                conn->server_->on_client_sent(conn);
+                break;
+            case IO_TYPE_RECV_ERROR:
+            case IO_TYPE_RECV_TIMEOUT:
+            case IO_TYPE_BEFORE_CLOSE:
+                conn->server_->release_client(conn);
+                break;
+            default:
+                break;
+            }
+            return 0;
+        }
+    };
+
+    struct AppHostSession : public node_base {
+        uintptr id_ = 0;
+        uint64_t generation_ = 0;
+        AppHostSession* next_active_ = nullptr;
+        _IoFunc io_func_;
+        MessageParser parser_;
+        uint32_t session_id_ = 0;
+        uintptr client_conn_ = 0;
+        std::queue<std::vector<uint8_t>> send_queue_;
+        Impl* server_ = nullptr;
+
+        AppHostSession() noexcept { io_func_.Exec = on_apphost_event; }
+
+        static int on_apphost_event(void* ctx, int type, uintptr param) noexcept {
+            auto* conn = static_cast<AppHostSession*>(ctx);
+            switch (type) {
+            case IO_TYPE_RECEIVED: {
+                auto* info = reinterpret_cast<_IoRecvInfo*>(param);
+                conn->server_->on_apphost_received(
+                    conn, reinterpret_cast<const uint8_t*>(info->p),
+                    static_cast<size_t>(info->len));
+                break;
+            }
+            case IO_TYPE_SENT:
+                conn->server_->on_apphost_sent(conn);
+                break;
+            case IO_TYPE_RECV_ERROR:
+            case IO_TYPE_RECV_TIMEOUT:
+            case IO_TYPE_BEFORE_CLOSE:
+                conn->server_->release_apphost(conn);
+                break;
+            default:
+                break;
+            }
+            return 0;
+        }
+    };
+
+    ClientSession* alloc_client(uintptr id) noexcept {
+        ClientSession* conn = nullptr;
+        while (atomic_compare_exchange((int&)client_lock_, 0, 1)) {}
+        call_result cr = client_pool_.FetchFreeNode(conn);
+        if (cr.IsSucceeded()) {
+            call_constructor(*conn);
+            client_pool_.PickFreeNode();
+            conn->id_ = id;
+            conn->generation_ = ++next_client_generation_;
+            conn->server_ = this;
+            conn->next_active_ = client_head_;
+            client_head_ = conn;
+        }
+        atomic_compare_exchange((int&)client_lock_, 1, 0);
+        return cr.IsSucceeded() ? conn : nullptr;
+    }
+
+    AppHostSession* alloc_apphost(uintptr id) noexcept {
+        AppHostSession* conn = nullptr;
+        while (atomic_compare_exchange((int&)apphost_lock_, 0, 1)) {}
+        call_result cr = apphost_pool_.FetchFreeNode(conn);
+        if (cr.IsSucceeded()) {
+            call_constructor(*conn);
+            apphost_pool_.PickFreeNode();
+            conn->id_ = id;
+            conn->generation_ = ++next_apphost_generation_;
+            conn->server_ = this;
+            conn->next_active_ = apphost_head_;
+            apphost_head_ = conn;
+        }
+        atomic_compare_exchange((int&)apphost_lock_, 1, 0);
+        return cr.IsSucceeded() ? conn : nullptr;
+    }
+
+    void release_client(ClientSession* conn) noexcept {
+        uint32_t session_id = 0;
+        while (atomic_compare_exchange((int&)client_lock_, 0, 1)) {}
+        ClientSession** pp = &client_head_;
+        while (*pp && *pp != conn)
+            pp = &(*pp)->next_active_;
+        const bool was_active = (*pp == conn);
+        if (was_active) {
+            *pp = conn->next_active_;
+            session_id = conn->session_id_;
+        }
+        atomic_compare_exchange((int&)client_lock_, 1, 0);
+        if (!was_active)
+            return;
+
+        if (session_id != 0) {
+            const uintptr peer = sessions_.find_apphost(session_id);
+            sessions_.remove_session(session_id);
+            if (peer != 0)
+                send_to_apphost(peer, make_packet(CmdType::CLOSE_SESSION, session_id));
+        } else {
+            sessions_.remove_by_client(conn->id_);
+        }
+
+        call_destructor(*conn);
+        while (atomic_compare_exchange((int&)client_lock_, 0, 1)) {}
+        client_pool_.PutFreeNode(conn);
+        atomic_compare_exchange((int&)client_lock_, 1, 0);
+    }
+
+    void release_apphost(AppHostSession* conn) noexcept {
+        uint32_t session_id = 0;
+        while (atomic_compare_exchange((int&)apphost_lock_, 0, 1)) {}
+        AppHostSession** pp = &apphost_head_;
+        while (*pp && *pp != conn)
+            pp = &(*pp)->next_active_;
+        const bool was_active = (*pp == conn);
+        if (was_active) {
+            *pp = conn->next_active_;
+            session_id = conn->session_id_;
+        }
+        atomic_compare_exchange((int&)apphost_lock_, 1, 0);
+        if (!was_active)
+            return;
+
+        if (session_id != 0) {
+            const uintptr peer = sessions_.find_client(session_id);
+            sessions_.remove_session(session_id);
+            if (peer != 0)
+                send_to_client(peer, make_packet(CmdType::CLOSE_SESSION, session_id));
+        } else {
+            sessions_.remove_by_apphost(conn->id_);
+        }
+
+        call_destructor(*conn);
+        while (atomic_compare_exchange((int&)apphost_lock_, 0, 1)) {}
+        apphost_pool_.PutFreeNode(conn);
+        atomic_compare_exchange((int&)apphost_lock_, 1, 0);
+    }
+
+    static int on_client_listen_event(void* ctx, int type, uintptr param) noexcept {
+        // only deal-with the IO_TYPE_ACCEPT_INIT 
+        if (type != IO_TYPE_ACCEPT_INIT)
+            return 0;
+        auto* self = static_cast<Impl*>(ctx);
+        ClientSession* conn = self->alloc_client(param);
+        if (conn == nullptr)
+            return 0;
+
+        bool cancelled = false;
+        self->pool_.GetFunc()->SetHandleFunc(
+            self->pool_.GetContext(), param, conn->io_func_, conn, cancelled);
+        if (cancelled) {
+            self->release_client(conn);
+            return 0;
+        }
+        return 1;
+    }
+
+    static int on_apphost_listen_event(void* ctx, int type, uintptr param) noexcept {
+        if (type != IO_TYPE_ACCEPT_INIT)
+            return 0;
+        auto* self = static_cast<Impl*>(ctx);
+        AppHostSession* conn = self->alloc_apphost(param);
+        if (conn == nullptr)
+            return 0;
+
+        bool cancelled = false;
+        self->pool_.GetFunc()->SetHandleFunc(
+            self->pool_.GetContext(), param, conn->io_func_, conn, cancelled);
+        if (cancelled) {
+            self->release_apphost(conn);
+            return 0;
+        }
+        return 1;
+    }
+
+    ClientSession* find_client_locked(uintptr id) const noexcept {
+        for (ClientSession* p = client_head_; p != nullptr; p = p->next_active_) {
+            if (p->id_ == id)
+                return p;
+        }
+        return nullptr;
+    }
+
+    AppHostSession* find_apphost_locked(uintptr id) const noexcept {
+        for (AppHostSession* p = apphost_head_; p != nullptr; p = p->next_active_) {
+            if (p->id_ == id)
+                return p;
+        }
+        return nullptr;
+    }
+
+    uint64_t client_generation(ClientSession* conn) noexcept {
+        while (atomic_compare_exchange((int&)client_lock_, 0, 1)) {}
+        ClientSession* active = find_client_locked(conn->id_);
+        const uint64_t generation = (active == conn) ? conn->generation_ : 0;
+        atomic_compare_exchange((int&)client_lock_, 1, 0);
+        return generation;
+    }
+
+    uint64_t apphost_generation(AppHostSession* conn) noexcept {
+        while (atomic_compare_exchange((int&)apphost_lock_, 0, 1)) {}
+        AppHostSession* active = find_apphost_locked(conn->id_);
+        const uint64_t generation = (active == conn) ? conn->generation_ : 0;
+        atomic_compare_exchange((int&)apphost_lock_, 1, 0);
+        return generation;
+    }
+
+    void enqueue_client(ClientSession* conn, std::vector<uint8_t> data) {
+        while (atomic_compare_exchange((int&)client_lock_, 0, 1)) {}
+        if (find_client_locked(conn->id_) != conn) {
+            atomic_compare_exchange((int&)client_lock_, 1, 0);
+            return;
+        }
+        // If client->send_queue_ is not empty, return 
+        if (!conn->send_queue_.empty()) {
+            conn->send_queue_.push(std::move(data));
+            atomic_compare_exchange((int&)client_lock_, 1, 0);
+            return;
+        }
+
+        bool cancelled = false;
+        byte* raw = pool_.GetFunc()->BeginInput(
+            pool_.GetContext(), conn->id_, static_cast<uint>(data.size()), cancelled);
+        if (raw && !cancelled) {
+            std::memcpy(raw, data.data(), data.size());
+            pool_.GetFunc()->EndInput(pool_.GetContext(), conn->id_);
+        } else if (!cancelled) {
+            conn->send_queue_.push(std::move(data));
+        }
+        atomic_compare_exchange((int&)client_lock_, 1, 0);
+    }
+
+    void enqueue_apphost(AppHostSession* conn, std::vector<uint8_t> data) {
+        while (atomic_compare_exchange((int&)apphost_lock_, 0, 1)) {}
+        if (find_apphost_locked(conn->id_) != conn) {
+            atomic_compare_exchange((int&)apphost_lock_, 1, 0);
+            return;
+        }
+        if (!conn->send_queue_.empty()) {
+            conn->send_queue_.push(std::move(data));
+            atomic_compare_exchange((int&)apphost_lock_, 1, 0);
+            return;
+        }
+
+        bool cancelled = false;
+        byte* raw = pool_.GetFunc()->BeginInput(
+            pool_.GetContext(), conn->id_, static_cast<uint>(data.size()), cancelled);
+        if (raw && !cancelled) {
+            std::memcpy(raw, data.data(), data.size());
+            pool_.GetFunc()->EndInput(pool_.GetContext(), conn->id_);
+        } else if (!cancelled) {
+            conn->send_queue_.push(std::move(data));
+        }
+        atomic_compare_exchange((int&)apphost_lock_, 1, 0);
+    }
+
+    void send_to_client(uintptr id, std::vector<uint8_t> data) {
+        ClientSession* target = nullptr;
+        while (atomic_compare_exchange((int&)client_lock_, 0, 1)) {}
+        target = find_client_locked(id);
+        atomic_compare_exchange((int&)client_lock_, 1, 0);
+        if (target != nullptr)
+            enqueue_client(target, std::move(data));
+    }
+
+    void send_to_apphost(uintptr id, std::vector<uint8_t> data) {
+        AppHostSession* target = nullptr;
+        while (atomic_compare_exchange((int&)apphost_lock_, 0, 1)) {}
+        target = find_apphost_locked(id);
+        atomic_compare_exchange((int&)apphost_lock_, 1, 0);
+        if (target != nullptr)
+            enqueue_apphost(target, std::move(data));
+    }
+
+    void schedule_client_drain(ClientSession* conn, uint64_t generation) {
+        drain_workers_.fetch_add(1, std::memory_order_acq_rel);
+        std::thread([this, conn, generation] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            drain_client_queue(conn, generation);
+            if (drain_workers_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                cv_.notify_all();
+        }).detach();
+    }
+
+    void schedule_apphost_drain(AppHostSession* conn, uint64_t generation) {
+        drain_workers_.fetch_add(1, std::memory_order_acq_rel);
+        std::thread([this, conn, generation] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            drain_apphost_queue(conn, generation);
+            if (drain_workers_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                cv_.notify_all();
+        }).detach();
+    }
+
+    void drain_client_queue(ClientSession* conn, uint64_t generation) {
+        while (atomic_compare_exchange((int&)client_lock_, 0, 1)) {}
+        if (find_client_locked(conn->id_) != conn || conn->generation_ != generation ||
+            conn->send_queue_.empty()) {
+            atomic_compare_exchange((int&)client_lock_, 1, 0);
+            return;
+        }
+
+        const auto& data = conn->send_queue_.front();
+        bool cancelled = false;
+        // alloc a data.size()-length part
+        byte* raw = pool_.GetFunc()->BeginInput(
+            pool_.GetContext(), conn->id_, static_cast<uint>(data.size()), cancelled);
+        if (raw && !cancelled) {
+            std::memcpy(raw, data.data(), data.size());
+            conn->send_queue_.pop();
+            // notify socket sends to the client
+            pool_.GetFunc()->EndInput(pool_.GetContext(), conn->id_);
+            atomic_compare_exchange((int&)client_lock_, 1, 0);
+            return;
+        }
+        const bool retry = !cancelled;
+        atomic_compare_exchange((int&)client_lock_, 1, 0);
+        if (retry)
+            schedule_client_drain(conn, generation);
+    }
+
+    void drain_apphost_queue(AppHostSession* conn, uint64_t generation) {
+        while (atomic_compare_exchange((int&)apphost_lock_, 0, 1)) {}
+        if (find_apphost_locked(conn->id_) != conn || conn->generation_ != generation ||
+            conn->send_queue_.empty()) {
+            atomic_compare_exchange((int&)apphost_lock_, 1, 0);
+            return;
+        }
+
+        const auto& data = conn->send_queue_.front();
+        bool cancelled = false;
+        byte* raw = pool_.GetFunc()->BeginInput(
+            pool_.GetContext(), conn->id_, static_cast<uint>(data.size()), cancelled);
+        if (raw && !cancelled) {
+            std::memcpy(raw, data.data(), data.size());
+            conn->send_queue_.pop();
+            pool_.GetFunc()->EndInput(pool_.GetContext(), conn->id_);
+            atomic_compare_exchange((int&)apphost_lock_, 1, 0);
+            return;
+        }
+        const bool retry = !cancelled;
+        atomic_compare_exchange((int&)apphost_lock_, 1, 0);
+        if (retry)
+            schedule_apphost_drain(conn, generation);
+    }
+
+    void on_client_sent(ClientSession* conn) {
+        const uint64_t generation = client_generation(conn);
+        if (generation != 0)
+            schedule_client_drain(conn, generation);
+    }
+
+    void on_apphost_sent(AppHostSession* conn) {
+        const uint64_t generation = apphost_generation(conn);
+        if (generation != 0)
+            schedule_apphost_drain(conn, generation);
+    }
+
+    void on_client_received(ClientSession* conn, const uint8_t* data, size_t len) {
+        conn->parser_.feed(data, len);
+        Packet pkt;
+        while (conn->parser_.next_packet(pkt) == ParseResult::OK) {
+            if (conn->session_id_ != 0)
+                sessions_.mark_client_seen(conn->session_id_, GatewayClock::now());
+            switch (pkt.header.cmd_type) {
+            case CmdType::SPAWN_APP:
+                handle_spawn_app(conn, pkt);
+                break;
+            case CmdType::HEARTBEAT:
+                enqueue_client(conn, make_packet(CmdType::HEARTBEAT, pkt.header.session_id));
+                break;
+            case CmdType::CLOSE_SESSION:
+                close_session(pkt.header.session_id);
+                break;
+            default:
+                forward_to_apphost(pkt);
+                break;
+            }
+        }
+    }
+
+    void on_apphost_received(AppHostSession* conn, const uint8_t* data, size_t len) {
+        conn->parser_.feed(data, len);
+        Packet pkt;
+        while (conn->parser_.next_packet(pkt) == ParseResult::OK) {
+            if (pkt.header.session_id != 0)
+                sessions_.mark_apphost_seen(pkt.header.session_id, GatewayClock::now());
+            switch (pkt.header.cmd_type) {
+            case CmdType::APPHOST_READY:
+                handle_apphost_ready(conn, pkt.header.session_id);
+                break;
+            case CmdType::HEARTBEAT:
+                enqueue_apphost(conn, make_packet(CmdType::HEARTBEAT, pkt.header.session_id));
+                break;
+            case CmdType::CLOSE_SESSION:
+                close_session(pkt.header.session_id);
+                break;
+            default:
+                forward_to_client(pkt);
+                break;
+            }
+        }
+    }
+
+    void handle_spawn_app(ClientSession* conn, const Packet& pkt) {
+        if (conn->session_id_ != 0 || sessions_.has_active_or_spawning_for_client(conn->id_)) {
+            enqueue_client(conn, make_error(conn->session_id_));
+            return;
+        }
+
+        if (!config_.auto_spawn_apphost) {
+            conn->session_id_ = sessions_.create_for_client(conn->id_);
+            enqueue_client(conn, make_packet(CmdType::SESSION_ACK, conn->session_id_));
+            return;
+        }
+
+        std::string app_name;
+        if (!parse_spawn_app_name(pkt, &app_name)) {
+            enqueue_client(conn, make_error(0));
+            return;
+        }
+        // check whether app_name is valid
+        auto app_it = config_.app_allowlist.find(app_name);
+        if (app_it == config_.app_allowlist.end() ||
+            config_.apphost_bin.empty() ||
+            ::access(config_.apphost_bin.c_str(), X_OK) != 0 ||
+            ::access(app_it->second.plugin_path.c_str(), R_OK) != 0) {
+            enqueue_client(conn, make_error(0));
+            return;
+        }
+
+        const auto now = GatewayClock::now();
+        const uint32_t session_id = sessions_.create_spawning_session(
+            conn->id_, app_name, app_it->second.plugin_path, now,
+            std::chrono::milliseconds(config_.spawn_timeout_ms));
+        conn->session_id_ = session_id;
+
+        AppHostLaunchConfig launch{};
+        launch.session_id = session_id;
+        launch.apphost_bin = config_.apphost_bin;
+        launch.gateway_host = config_.apphost_bind_host;
+        launch.gateway_port = config_.apphost_internal_port;
+        launch.plugin_path = app_it->second.plugin_path;
+        launch.width = app_it->second.width;
+        launch.height = app_it->second.height;
+
+        AppHostProcess proc{};
+        if (!process_manager_.spawn_apphost(launch, &proc)) {
+            sessions_.remove_session(session_id);
+            conn->session_id_ = 0;
+            enqueue_client(conn, make_error(session_id));
+            return;
+        }
+        sessions_.set_apphost_pid(session_id, static_cast<int>(proc.pid));
+        // The client is not acknowledged here. The forked AppHost must first
+        // connect back to the internal listener and send APPHOST_READY so the
+        // session can be bound to a concrete AppHost socket.
+    }
+
+    void handle_apphost_ready(AppHostSession* conn, uint32_t session_id) {
+        // APPHOST_READY is the handshake that completes an auto-spawned
+        // session: it proves which accepted AppHost connection owns the
+        // Gateway-assigned session id.
+        if (!sessions_.bind_apphost(session_id, conn->id_))
+            return;
+
+        conn->session_id_ = session_id;
+        const auto route = sessions_.find(session_id);
+        conn->client_conn_ = route.client_conn;
+
+        while (atomic_compare_exchange((int&)client_lock_, 0, 1)) {}
+        ClientSession* client = find_client_locked(route.client_conn);
+        if (client != nullptr)
+            client->apphost_conn_ = conn->id_;
+        atomic_compare_exchange((int&)client_lock_, 1, 0);
+
+        if (config_.auto_spawn_apphost && route.client_conn != 0) {
+            // Only after the AppHost socket is bound can the client safely send
+            // INPUT_EVENT messages that Gateway can route to the correct peer.
+            send_to_client(route.client_conn, make_packet(CmdType::SESSION_ACK, session_id));
+        }
+    }
+
+    void forward_to_apphost(const Packet& pkt) {
+        const uintptr target = sessions_.find_apphost(pkt.header.session_id);
+        if (target != 0)
+            send_to_apphost(target, serialize_packet(pkt));
+    }
+
+    void forward_to_client(const Packet& pkt) {
+        const uintptr target = sessions_.find_client(pkt.header.session_id);
+        if (target != 0)
+            send_to_client(target, serialize_packet(pkt));
+    }
+
+    void close_session(uint32_t session_id) {
+        const auto route = sessions_.find(session_id);
+        int pid = -1;
+        sessions_.get_pid(session_id, &pid);
+        sessions_.remove_session(session_id);
+        if (route.client_conn != 0)
+            send_to_client(route.client_conn, make_packet(CmdType::CLOSE_SESSION, session_id));
+        if (route.apphost_conn != 0)
+            send_to_apphost(route.apphost_conn, make_packet(CmdType::CLOSE_SESSION, session_id));
+        if (pid > 0)
+            process_manager_.terminate(static_cast<pid_t>(pid));
+    }
+
+    bool start(uint16_t public_port, uint16_t apphost_internal_port) {
+        Gateway::Config cfg{};
+        cfg.public_port = public_port;
+        cfg.apphost_internal_port = apphost_internal_port;
+        cfg.auto_spawn_apphost = false;
+        return start(cfg);
+    }
+
+    bool start(const Gateway::Config& config) {
+        config_ = config;
+        // gateway maintains a IoPool 
+        pool_ = _IoPool_Fetch();
+        if (pool_.IsNull())
+            return false;
+
+        bool cancelled = false;
+        // listen to the public_port : client_side
+        client_listen_id_ = pool_.GetFunc()->StartListen(
+            pool_.GetContext(), static_cast<uint>(config_.public_port),
+            _IoFunc{on_client_listen_event}, this, cancelled);
+        if (client_listen_id_ == 0 || cancelled) {
+            _IoPool_Disable();
+            return false;
+        }
+
+        cancelled = false;
+        // listen to the apphost_internal_port : apphost_side
+        apphost_listen_id_ = pool_.GetFunc()->StartListen(
+            pool_.GetContext(), static_cast<uint>(config_.apphost_internal_port),
+            _IoFunc{on_apphost_listen_event}, this, cancelled);
+        if (apphost_listen_id_ == 0 || cancelled) {
+            pool_.GetFunc()->DisableHandle(pool_.GetContext(), client_listen_id_);
+            client_listen_id_ = 0;
+            _IoPool_Disable();
+            return false;
+        }
+
+        running_.store(true, std::memory_order_release);
+        monitor_thread_ = std::thread([this] { monitor_loop(); });
+        return true;
+    }
+
+    void monitor_loop() {
+        while (running_.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(config_.monitor_interval_ms));
+            // First handle failures that the OS can prove: an AppHost child
+            // process has exited. waitpid() cannot detect a live-but-stuck
+            // AppHost, but it is the authoritative source for crash/exit cases.
+            for (const auto& exited : process_manager_.reap_exited()) {
+                const uint32_t session_id = sessions_.find_by_pid(static_cast<int>(exited.pid));
+                if (session_id != 0)
+                    fail_session(session_id, true);
+            }
+
+            // Then handle protocol/session timeouts. These cover cases where no
+            // child exit is visible yet: AppHost may still be alive but failed to
+            // finish the startup handshake, or either side may have stopped
+            // sending valid packets after the session became active.
+            const auto now = GatewayClock::now();
+            for (const auto& snap : sessions_.snapshot_sessions()) {
+                if (snap.state == SessionState::SPAWNING && now > snap.spawn_deadline) {
+                    // Gateway fork/exec'd an AppHost, but it did not connect back
+                    // and send APPHOST_READY before the startup deadline.
+                    fail_session(snap.session_id, true);
+                    continue;
+                }
+                if (snap.state == SessionState::ACTIVE) {
+                    if (now - snap.last_client_seen >
+                        std::chrono::milliseconds(config_.client_timeout_ms)) {
+                        // The client side is presumed gone or unresponsive. Do
+                        // not send ERROR_RESP to the peer that already timed out.
+                        fail_session(snap.session_id, false);
+                        continue;
+                    }
+                    if (now - snap.last_apphost_seen >
+                        std::chrono::milliseconds(config_.apphost_timeout_ms)) {
+                        // The AppHost process/socket may still exist, but the
+                        // protocol side is stale; notify the client of backend
+                        // failure before tearing down the session.
+                        fail_session(snap.session_id, true);
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+
+    void fail_session(uint32_t session_id, bool notify_client_error) {
+        SessionTable::Route route{};
+        int pid = -1;
+        if (!sessions_.transition_to_closing(session_id, &route, &pid))
+            return;
+        if (notify_client_error && route.client_conn != 0)
+            send_to_client(route.client_conn, make_error(session_id));
+        if (route.apphost_conn != 0)
+            pool_.GetFunc()->DisableHandle(pool_.GetContext(), route.apphost_conn);
+        if (route.client_conn != 0)
+            pool_.GetFunc()->DisableHandle(pool_.GetContext(), route.client_conn);
+        if (pid > 0)
+            process_manager_.terminate(static_cast<pid_t>(pid));
+        sessions_.remove_session(session_id);
+    }
+
+    void stop() {
+        if (!running_.exchange(false, std::memory_order_acq_rel))
+            return;
+
+        if (monitor_thread_.joinable())
+            monitor_thread_.join();
+
+        for (const auto& snap : sessions_.snapshot_sessions())
+            fail_session(snap.session_id, false);
+
+        if (client_listen_id_ != 0) {
+            pool_.GetFunc()->DisableHandle(pool_.GetContext(), client_listen_id_);
+            client_listen_id_ = 0;
+        }
+        if (apphost_listen_id_ != 0) {
+            pool_.GetFunc()->DisableHandle(pool_.GetContext(), apphost_listen_id_);
+            apphost_listen_id_ = 0;
+        }
+        _IoPool_Disable();
+        for (const auto& exited : process_manager_.reap_exited()) {
+            (void)exited;
+        }
+
+        while (atomic_compare_exchange((int&)client_lock_, 0, 1)) {}
+        ClientSession* c = client_head_;
+        client_head_ = nullptr;
+        while (c != nullptr) {
+            ClientSession* next = c->next_active_;
+            call_destructor(*c);
+            client_pool_.PutFreeNode(c);
+            c = next;
+        }
+        atomic_compare_exchange((int&)client_lock_, 1, 0);
+
+        while (atomic_compare_exchange((int&)apphost_lock_, 0, 1)) {}
+        AppHostSession* a = apphost_head_;
+        apphost_head_ = nullptr;
+        while (a != nullptr) {
+            AppHostSession* next = a->next_active_;
+            call_destructor(*a);
+            apphost_pool_.PutFreeNode(a);
+            a = next;
+        }
+        atomic_compare_exchange((int&)apphost_lock_, 1, 0);
+
+        {
+            std::unique_lock<std::mutex> lk(wait_mtx_);
+            cv_.wait(lk, [this] {
+                return drain_workers_.load(std::memory_order_acquire) == 0;
+            });
+        }
+        cv_.notify_all();
+    }
+
+    void wait() {
+        std::unique_lock<std::mutex> lk(wait_mtx_);
+        cv_.wait(lk, [this] {
+            return !running_.load(std::memory_order_acquire);
+        });
+    }
+
+    GKC::LcInterface<_IIoPool> pool_;
+    uintptr client_listen_id_ = 0;
+    uintptr apphost_listen_id_ = 0;
+
+    free_list<ClientSession> client_pool_;
+    ClientSession* client_head_ = nullptr;
+    volatile int client_lock_ = 0;
+    uint64_t next_client_generation_ = 0;
+
+    free_list<AppHostSession> apphost_pool_;
+    AppHostSession* apphost_head_ = nullptr;
+    volatile int apphost_lock_ = 0;
+    uint64_t next_apphost_generation_ = 0;
+
+    SessionTable sessions_;
+    ProcessManager process_manager_;
+    Gateway::Config config_;
+    std::atomic<bool> running_{false};
+    std::atomic<int> drain_workers_{0};
+    std::thread monitor_thread_;
+    std::mutex wait_mtx_;
+    std::condition_variable cv_;
+};
+
+Gateway::Gateway() : impl_(std::make_unique<Impl>()) {}
+
+Gateway::~Gateway() {
+    if (impl_ && impl_->running_.load(std::memory_order_acquire))
+        impl_->stop();
+}
+
+bool Gateway::start(uint16_t public_port, uint16_t apphost_internal_port) {
+    return impl_->start(public_port, apphost_internal_port);
+}
+
+bool Gateway::start(const Config& config) {
+    return impl_->start(config);
+}
+
+void Gateway::stop() {
+    impl_->stop();
+}
+
+void Gateway::wait() {
+    impl_->wait();
+}
+
+bool Gateway::is_running() const {
+    return impl_ && impl_->running_.load(std::memory_order_acquire);
+}

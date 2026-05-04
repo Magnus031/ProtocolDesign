@@ -63,3 +63,20 @@ cc_test(
     ],
     copts = ["-std=c++17"],
 )
+
+cc_test(
+    name = "gateway_m4_plugin_test",
+    srcs = ["gateway_m4_plugin_test.cpp"],
+    data = [
+        "//plugins/demo_app:libdemo_app.so",
+        "//src/apphost:apphost_bin",
+    ],
+    deps = [
+        ":gateway",
+        "//src/protocol:message_parser",
+        "//src/protocol:protocol",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+    copts = ["-std=c++17"],
+)

@@ -46,6 +46,7 @@ int main(int argc, char* argv[]) {
                 std::fprintf(stderr, "Invalid --app. Expected --app=name=plugin_path\n");
                 return 1;
             }
+            // register app_allowlist
             config.app_allowlist[spec.substr(0, eq)] =
                 Gateway::AppEntry{spec.substr(eq + 1), 800, 600};
         } else {

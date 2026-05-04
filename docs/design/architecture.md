@@ -173,7 +173,7 @@ ProtocolDesign/
 │   │   ├── ui_host_impl.cpp
 │   │   ├── pixel_capture.h    # capture_rect(pBuffer, width, rcPaint)→像素字节；供 ui_host_impl 使用
 │   │   ├── pixel_capture.cpp
-│   │   ├── plugin_loader.h    # dlopen/dlsym("sa_ui_main")，调用 Exec()
+│   │   ├── plugin_loader.h    # dlopen/dlsym("_SA_UIMain")，调用 _SA_UIMain(lcHost, args)
 │   │   ├── plugin_loader.cpp
 │   │   ├── main.cpp
 │   │   └── BUILD
@@ -442,19 +442,42 @@ Client 里: 像素 → Wayland/Win32 → 屏幕
 AppHost 里: 像素 → ui_host_impl → 截获 → 发网络
 ```
 
-### 5.2 SA_UIMain 插件接口（GKC 标准）
+### 5.2 _SA_UIMain 插件接口（GKC 标准）
 
-`.so` 插件的入口约定，AppHost 通过 `dlsym("sa_ui_main")` 加载：
+`.so` / `.dll` 插件的入口约定，AppHost / Client 通过 `dlsym("_SA_UIMain")` 加载。GKC 在 `public/include/base/GkcGui.cpp` 中已经提供了入口 shim：
 
 ```cpp
-struct SA_UIMain {
-    // AppHost 调用此函数，传入 IUiHost 接口和启动参数
-    int (*Exec)(const GKC::LcInterface<GKC::IUiHost>& lcHost,
-                const GKC::ConstArray<GKC::ConstStringS>& args) noexcept;
-};
-
-extern "C" GKC::SA_UIMain* sa_ui_main();  // 插件必须以 C 链接导出此符号
+// 由 GKC 提供（GkcGui.cpp）：插件 .so 链接此源文件后即可获得入口
+extern "C" int _SA_UIMain(const GKC::LcInterface<GKC::IUiHost>& lcHost,
+                          const GKC::ConstArray<GKC::ConstStringS>& args) noexcept;
+// 内部实现：把 lcHost 赋给插件本地的 GKC::g_ui_host，然后调用
+// program_entry_point::GuiMain(args) —— 这才是插件作者要实现的函数。
 ```
+
+插件作者只需实现 `program_entry_point::GuiMain(args)`，不需要自己导出 `_SA_UIMain`：
+
+```cpp
+// 插件源代码（demo_app.cpp 等）
+namespace program_entry_point {
+    int GuiMain(const GKC::ConstArray<GKC::ConstStringS>& args) {
+        // 创建 Toplevel，注册 handler，进入 GuiHelper::Loop()
+        ...
+    }
+}
+```
+
+宿主侧（AppHost / Client）调用约定：
+
+```
+1. dlopen(plugin_path, RTLD_NOW | RTLD_LOCAL)
+2. dlsym(handle, "_SA_UIMain") → fn
+3. 构造 LcInterface<IUiHost>，让 GetFunc()/GetContext() 指向宿主自己的 IUiHost 实现
+   - AppHost 用 ui_host_impl 提供的 fake/headless 实现
+   - Client 用 GKC 提供的真实 GUI 实现
+4. fn(lcHost, args) 阻塞执行直到插件返回
+```
+
+> **链接拓扑**：插件 .so 必须把 `GkcGui.cpp` 链入自身（提供插件本地的 `g_ui_host` 存储 + `_SA_UIMain` shim）；宿主二进制**不要**重复链接 `GkcGui.cpp`，否则宿主与插件各有一份独立的 `g_ui_host`，宿主写入的 fake host 不会被插件看到。
 
 ### 5.3 UI 基础类型
 
@@ -567,10 +590,10 @@ AppHost 是服务端的核心执行单元，负责加载业务插件并提供假
 ```
 1. 由 Gateway 通过 fork/exec 拉起
 2. 通过 dlopen() 加载指定的业务 .so 插件
-3. 通过 dlsym("sa_ui_main") 解析插件入口
-4. 创建 ui_host_impl（假的 IUiHost），拦截 DoDraw 输出
+3. 通过 dlsym("_SA_UIMain") 解析插件入口
+4. 创建 ui_host_impl（headless 假 IUiHost），拦截 DoDraw 输出
 5. 建立与 Gateway 的 TCP 连接（IoPool StartConnect）
-6. 调用插件 Exec(ui_host_impl, args)，进入 GuiHelper::Loop()
+6. 调用 `_SA_UIMain(lcHost{ui_host_impl}, args)`，插件内部进入 `GuiHelper::Loop()`
 ```
 
 #### 像素传输流程（rcPaint 直接传输，无逐帧比对）
@@ -683,14 +706,14 @@ Client 与 AppHost **完全对称**：`src/client/` 是通用插件加载器可�
 #### Client 可执行程序职责
 
 - 解析命令行参数（`--plugin`、`--gateway-host`、`--gateway-port`）
-- 加载 `.so`/`.dll` 插件，调用 `sa_ui_main()` 的 `Exec(real_gkc_ui_host, args)`
+- 加载 `.so`/`.dll` 插件，调用 `_SA_UIMain(lcHost{real_gkc_ui_host}, args)`
 - 提供 `PixelRenderer`（线程安全像素缓冲区）供插件使用
 
 #### client_viewer 插件启动流程
 
 ```
-Exec(real_gkc_ui_host, args)
-    ↓
+_SA_UIMain(lcHost{real_gkc_ui_host}, args)
+    ↓ （shim 内：g_ui_host = lcHost; program_entry_point::GuiMain(args)）
 创建 ViewerWindow（ToplevelImpl 子类）
     ↓
 IoPool StartConnect → Gateway

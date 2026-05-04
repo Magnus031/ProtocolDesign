@@ -1044,72 +1044,158 @@ plugin_loader / ui_host_impl / DoDraw -> PIXEL_DATA
 
 ## M4 — AppHost 插件系统 + ui_host_impl（rcPaint 直接传输）
 
-**目标**：AppHost 通过 `plugin_loader` 加载业务 `.so` 插件，`ui_host_impl` 实现"假的" GKC `IUiHost`，拦截 `DoDraw()` 回调，直接使用 `pDraw->rcPaint` 和 `pDraw->pBuffer` 打包 PIXEL_DATA 发出。**不做逐帧像素比对**。
+**目标**：AppHost 通过 `plugin_loader` 加载业务 `.so` 插件，`ui_host_impl` 实现一套 **headless 的假 `IUiHost`**：不开真实窗口、不依赖 Wayland，自己在内存里维护窗口缓冲区、主动派发 `UI_MESSAGE_DRAW`。每次 `DoDraw` 之后立即用 `pDraw->rcPaint` 和 `pDraw->pBuffer` 打包 PIXEL_DATA 发往 Gateway。**不做逐帧像素比对**。
+
+> **架构原则（不对称）**：AppHost 端用我们自己实现的 fake/headless `ui_host_impl`，不创建真实窗口；Client 端（M6）用 GKC 提供的真实 GUI `IUiHost`。两端业务插件代码对称（都基于 `g_ui_host` / `ToplevelImpl`），但 IUiHost 实现不对称。M4 只负责服务端那一半。
 
 ### 4.1 脏矩形传输的新设计
 
 GKC 的 `DoDraw()` 回调已经携带了当次重绘的脏矩形：
 
 ```
-插件调用（或 GKC 事件驱动触发）DoDraw(pDraw)
-    pDraw->rcPaint  = 本次脏矩形区域（GKC 自维护）
-    pDraw->pBuffer  = 整个窗口像素缓冲区
-    pDraw->iWidth/iHeight = 窗口尺寸
+插件 Show(true) 或 Damage(rect) → fake host 派发 UI_MESSAGE_DRAW
+    → 插件 DoDraw(pDraw)：
+        pDraw->rcPaint        = 本次脏矩形（fake host 设置）
+        pDraw->pBuffer        = WindowRuntime 持有的整窗 color_quad 缓冲
+        pDraw->iWidth/iHeight = 窗口尺寸（来自 SPAWN_APP/--width/--height）
+    → 插件向 pBuffer 写像素，DoDraw 返回
 
-ui_host_impl 捕获：
-    pixel_capture(pDraw->pBuffer, pDraw->iWidth, pDraw->rcPaint)
-        → 裁出 rcPaint 区域的 ARGB 字节
-        → 打包 PIXEL_DATA Body：
-          [frameSeq(4)][rcLeft(4)][rcTop(4)][rcRight(4)][rcBottom(4)][dataLen(4)][pixelData...]
-        → WorkPool 快速池：BeginInput/EndInput 发往 Gateway
+ui_host_impl 捕获并打包（同步，主线程内完成）：
+    auto body = pack_pixel_data_rect(
+        pDraw->pBuffer, pDraw->iWidth,
+        rcPaint.left, rcPaint.top, rcPaint.right, rcPaint.bottom,
+        frame_seq);
+        // pack_pixel_data_rect 一站完成：
+        //   1. 按 [left,right) × [top,bottom) 从 color_quad* 缓冲裁剪
+        //   2. 把 GKC color_quad（little-endian B,G,R,A）重排为协议
+        //      要求的 [A,R,G,B] 大端字节流
+        //   3. 拼出 PIXEL_DATA Body：
+        //      [frameSeq(4)][rcLeft(4)][rcTop(4)][rcRight(4)][rcBottom(4)][dataLen(4)][pixelData...]
+    send_to_gateway(body);   // 同步 send 到 IoPool 句柄
 ```
 
-因为触发 `DoDraw` 的原因（鼠标事件、键盘事件、计时器等）就决定了哪块区域需要重绘，`rcPaint` 天然是最小更新区域，**无需保存上一帧做比对**。
+`rcPaint` 由 fake host 在派发 `UI_MESSAGE_DRAW` 前设置：`Show(true)` 触发的首帧 `rcPaint = {0, 0, w, h}`，`Damage(rect)` 触发的局部帧 `rcPaint = rect`。M4 不做 coalesce，每次 `Damage` 就是一次 DoDraw 加一次 PIXEL_DATA。
+
+> **像素格式注意**：GKC `pBuffer` 是 `color_quad*`（`color_quad = uint32_t`）。`COLOR_QUAD_MAKE(r,g,b,a)` 的位布局是 `bit31..0 = a r g b`，因此在 little-endian Linux 上的内存字节顺序是 `B, G, R, A`。协议 wire 顺序是 `[A, R, G, B]` 大端，必须在 `pack_pixel_data_rect` 内逐像素重排。`capture_rect` **保持现有"纯字节裁剪"语义不变**（M2 的契约），仅供旧测试 / 字节缓冲场景使用，不参与 M4 主路径打包。
 
 ### 4.2 需要实现/修改的文件
 
 | 文件 | 内容 |
 |------|------|
-| `src/apphost/ui_host_impl.h/.cpp` | 实现 GKC `IUiHost` 接口：拦截 DoDraw，调用 pixel_capture，经 WorkPool 异步发 PIXEL_DATA |
-| `src/apphost/pixel_capture.h/.cpp` | `capture_rect(pBuffer, width, rcPaint)` → `std::vector<uint8_t>` 像素字节 |
-| `src/apphost/plugin_loader.h/.cpp` | `dlopen` 加载 `.so`，`dlsym("sa_ui_main")`，调用 `Exec(g_ui_host, args)` |
-| `src/apphost/apphost.h/.cpp`（更新） | 集成 plugin_loader；移除静态帧逻辑；输入事件处理 stub（M5 完善） |
-| `plugins/demo_app/demo_app.cpp` | 示例插件：创建 Toplevel，DoDraw 画纯色背景，DoClose 退出 |
-| `plugins/demo_app/BUILD` | 构建为 `.so` 共享库 |
-| `src/apphost/m4_plugin_test.cpp` | 集成测试：加载插件，TestClient 收到 PIXEL_DATA |
+| `src/apphost/ui_host_impl.h/.cpp` | headless 假 `IUiHost`：内部 `WindowRuntime { std::vector<color_quad> pixels; UiMessageHandler handler; void* ctx; ... }`；实现 `CreateToplevel/Show/Destroy/Damage/Loop/Quit/PostWork/AddTimer`；`Show(true)` 自动派发首帧整窗 `UI_MESSAGE_DRAW`，`Damage(rect)` 同步派发局部 `UI_MESSAGE_DRAW`；DoDraw 返回后调用 `capture_rect` + `pack_pixel_data_rect` 并同步 `send` PIXEL_DATA |
+| `src/apphost/pixel_capture.h/.cpp` | 保留现有 `capture_rect` 字节裁剪语义；**新增** `pack_pixel_data_rect(const color_quad* pixels, int stride, int left, int top, int right, int bottom, uint32_t frame_seq)` → `std::vector<uint8_t>`，负责"GKC color_quad 内存（B,G,R,A）→ 协议 ARGB wire（[A,R,G,B] 大端）"转换并拼出 PIXEL_DATA Body |
+| `src/apphost/plugin_loader.h/.cpp` | `dlopen(path, RTLD_NOW \| RTLD_LOCAL)` 加载 `.so`，`dlsym("_SA_UIMain")` 取 `extern "C"` 入口，构造 `LcInterface<IUiHost>`（指向 AppHost 的 fake host），调用 `_SA_UIMain(lcHost, args)` |
+| `src/apphost/apphost.h/.cpp`（更新） | 集成 plugin_loader 与 ui_host_impl；接收 `--plugin/--width/--height` 启动参数；删除现有静态 16×16 红帧逻辑；INPUT_EVENT 处理留 stub（M5 完善）；CLOSE_SESSION 收到后直接调用 fake host 的 Quit（线程安全） |
+| `plugins/demo_app/demo_app.cpp` | 示例插件：实现 `program_entry_point::GuiMain`，创建 `ToplevelImpl<DemoWindow>`，`Show(true)` 后等待事件；DoDraw 用 `COLOR_QUAD_BLUE` 填整窗背景 + 在固定子矩形画 `COLOR_QUAD_RED`；外部触发或定时器引发一次 `Damage(small_rect)` 用于测试 |
+| `plugins/demo_app/BUILD` | `cc_binary(name="libdemo_app.so", linkshared=True, deps=[...])`，依赖 GKC 头 + `:gkc_gui_runtime`（提供 `g_ui_host` 存储和 `_SA_UIMain` shim） |
+| `third_party/BUILD`（或 `third_party/GKC/BUILD`） | 新增 `cc_library` 目标 `:gkc_gui_runtime`（含 `public/include/base/GkcGui.cpp`）。**仅供插件 .so 链接，AppHost 二进制不依赖它。** |
+| `src/apphost/m4_plugin_test.cpp` | 集成测试：fake Gateway 监听 → 启动 AppHost 子进程（`--gateway-host/--gateway-port/--session-id/--plugin/--width/--height`）→ 收到 APPHOST_READY 与两包 PIXEL_DATA → 关闭 |
+| `src/apphost/apphost_lifecycle_test.cpp`（保留旧 apphost_test 网络行为） | 连接建立、HEARTBEAT echo、CLOSE_SESSION 退出、多 PIXEL_DATA 包顺序——从被替换的 `apphost_test.cpp` 中迁移这些断言 |
 
-> `src/apphost/dirty_rect_detector.h/.cpp` **在本 Milestone 删除**，不再使用。
-> `src/apphost/pixel_buffer.h/.cpp` **简化**：不再需要双帧（prev/current）存储，仅保留单帧辅助结构（如有必要）。
+> `src/apphost/dirty_rect_detector.h/.cpp` 已在 M2 之前删除，不在 M4 范围内（参见 memory）。
+> `src/apphost/pixel_buffer.h/.cpp` **删除**。M4 主路径的窗口像素由 `ui_host_impl::WindowRuntime` 直接持有 `std::vector<color_quad>`，避免"窗口内存格式（B,G,R,A）"和"协议 wire 格式（[A,R,G,B]）"两层语义混淆。
+> 旧的 `src/apphost/apphost_test.cpp`（M2 静态红帧测试）整体替换为上面两个新测试。
+
+**链接拓扑要求（必须验证）**：
+
+```
+demo_app.so
+  ├─ deps: //third_party:gkc_gui_runtime   (GkcGui.cpp → 提供插件本地的 g_ui_host + _SA_UIMain)
+  └─ deps: //third_party:GkcSys 或 GKC 纯头依赖
+
+apphost_bin
+  ├─ deps: ui_host_impl + plugin_loader    (自己实现一套 IUiHost 函数表)
+  └─ **不要** deps gkc_gui_runtime
+```
+
+风险点：如果 AppHost 也链接了 `GkcGui.cpp`，AppHost 与插件 .so 各自会有一份独立的 `GKC::g_ui_host` 全局变量；AppHost 设置的 fake host 不会被插件看到，导致插件调用 `g_ui_host.GetFunc()` 拿到空表 → 崩溃。M4 实现时要写一个小的链接探针：在 demo 插件 `GuiMain` 入口处 `assert(GKC::g_ui_host.GetFunc() != nullptr)`，确认它拿到的就是 AppHost 注入的 fake host。
 
 ### 4.3 多线程模型（本 Milestone 明确）
 
+M4 **不引入** GKC `WorkPool` / `PostWork` 线程模型。捕获、打包、发送都在主线程同步完成，仅依赖一个线程安全的 `Quit` 让 IoPool 线程能唤醒主线程退出。M5 再把输入事件的 `PostWork` 路径补齐。
+
 ```
 主线程
-  └── 加载 .so → plugin.Exec(g_ui_host, args) → GuiHelper::Loop()
-         │
-         ├── DoDraw() 回调（GKC 主线程触发）
-         │     └── ui_host_impl 捕获 rcPaint + 像素
-         │           └── _WorkPool_Submit(false, send_pixel_task, ctx)
-         └── DoClose() → GuiHelper::Quit()
+  ├── 解析 --gateway-host/port/session-id/plugin/width/height
+  ├── connect Gateway, send APPHOST_READY
+  ├── _IoPool_Fetch + SetHandleFunc(gateway_conn, io_func)
+  ├── plugin_loader.load(plugin_path)
+  │     └── _SA_UIMain(lcHost, args)  // lcHost 指向 fake host
+  │           └── program_entry_point::GuiMain(args)
+  │                 ├── window.Create(...)
+  │                 ├── window.Show(true)
+  │                 │     └── fake host 派发 UI_MESSAGE_DRAW(rcPaint=full)
+  │                 │           └── 插件 DoDraw 写 pBuffer
+  │                 │                 └── ui_host_impl 同步 capture_rect
+  │                 │                       + pack_pixel_data_rect
+  │                 │                       + send(PIXEL_DATA)  ← 主线程内同步
+  │                 └── GuiHelper::Loop()  ← 阻塞主线程，等 quit_flag
+  └── _IoPool_Disable + cleanup
 
-WorkPool 快速池线程
-  └── send_pixel_task：BeginInput/EndInput 发 PIXEL_DATA
+IoPool 线程（GKC 内部）
+  └── IO_TYPE_RECEIVED → MessageParser.feed()
+        ├── HEARTBEAT  → 同线程直接 echo send（与 M2/M3b 一致）
+        └── CLOSE_SESSION → 直接调用 fake host 的 Quit()
+              （Quit 线程安全：set quit_flag + wake Loop）
 
-IoPool 线程
-  └── IO_TYPE_RECEIVED → MessageHandler.feed()
-        └── 处理器注册的回调（HEARTBEAT / CLOSE_SESSION）
-              └── 需要更新 UI 状态时：g_ui_host.GetFunc()->PostWork(...)
+业务输入事件（INPUT_EVENT）
+  M4 仅 stub：IoPool 线程收到后直接丢弃或日志记录。
+  M5 引入 PostWork：IoPool 线程 → fake host PostWork → 主线程 → 插件 DoMouse/DoKeyboard。
 ```
+
+**Loop / Quit 语义（M4 假宿主必备）**
+
+```cpp
+// fake host 内部
+std::mutex                    mtx_;
+std::condition_variable       cv_;
+bool                          quit_  = false;
+std::deque<PendingWork>       queue_;   // M4 暂时只装"Damage 引发的同步 draw"占位；
+                                        // PostWork 队列在 M5 启用
+
+int  Loop(void*) {
+    std::unique_lock<std::mutex> lk(mtx_);
+    cv_.wait(lk, [&]{ return quit_ || !queue_.empty(); });
+    // M4：唯一的退出条件是 quit_ = true
+    return 0;
+}
+void Quit(void*) {
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        quit_ = true;
+    }
+    cv_.notify_all();
+}
+```
+
+`Quit` 必须可从任意线程调用（包括 IoPool 线程）。`Loop` 在主线程阻塞，被 `Quit` 唤醒后返回，`_SA_UIMain` 随之返回，主线程进入 `_IoPool_Disable + cleanup` 收尾。
+
+`PostWork` / `AddTimer` 在 M4 是简化实现而非空 stub：
+
+- `PostWork(work, data)`：把 `(work, data)` 入队后 `cv_.notify_all()`；`Loop` 在 wait 唤醒后 drain 队列、依次同步执行。这样即使 demo 插件或 GKC wrapper 内部偷用了 `PostWork`，主线程仍能消费、不会卡死。
+- `AddTimer`：M4 直接返回 0（不创建定时器）。demo 插件不依赖定时器；如果未来某个插件依赖，再补。
+- M4 仍**不让** IoPool 线程通过 `PostWork` 注入 INPUT_EVENT —— 那是 M5 的工作；INPUT_EVENT 在 M4 的 IoPool 处理器里直接丢弃。
+
+也就是说 M4 的 Loop 真实条件是"`quit_ == true` 或 `queue_` 非空（消费完继续 wait）"，与上面伪代码里给的最小骨架等价。
 
 ### 4.4 测试要求
 
-| 测试用例 | 期望结果 |
-|----------|----------|
-| `PluginLoads` | `plugin_loader` 加载 `demo_app.so`，`sa_ui_main()` 返回非空，`Exec()` 不 crash |
-| `PixelDataReceived` | TestClient 连接，收到 PIXEL_DATA，rcPaint 坐标合法，像素值与 demo 插件一致 |
-| `PixelCaptureUnit` | 单元测试：`capture_rect` 裁出正确的子矩形字节 |
+测试采用 **反向连接 + fake Gateway** 模型：测试进程内一个轻量 fake Gateway `listen()` 在某个端口，启动 AppHost 子进程并通过 `--gateway-host/--gateway-port/--session-id/--plugin/--width/--height` 让其连入。fake Gateway 只需具备：accept、收 `APPHOST_READY`、收 PIXEL_DATA、按需回 HEARTBEAT/CLOSE_SESSION。
 
-**通过标准**：`bazel test //src/apphost:m4_plugin_test //src/apphost:pixel_capture_test` 全部 PASSED。
+| 测试 | 用例 | 期望结果 |
+|------|------|----------|
+| `pixel_capture_test` | `CaptureRectByteOrder` | `capture_rect` 在给定 stride 下裁出正确的字节序列（M2 字节裁剪语义） |
+| `pixel_capture_test` | `PackPixelDataConvertsBgraToArgb` | `pack_pixel_data_rect` 将 `color_quad`（B,G,R,A in mem）转换为 wire `[A,R,G,B]`，并正确拼出 PIXEL_DATA Body 头部字段 |
+| `m4_plugin_test` | `PluginLoadsAndSeesFakeHost` | AppHost 子进程加载 `libdemo_app.so`，插件入口处 `assert(g_ui_host.GetFunc() != nullptr)` 通过，未 crash |
+| `m4_plugin_test` | `InitialFullFrame` | 连接 + Show(true) 后收到 1 包 PIXEL_DATA：rect == 整窗，dataLen == w·h·4，像素全为 demo 背景蓝 |
+| `m4_plugin_test` | `DirtyRectIsSubset` | 触发一次 `Damage(small_rect)` 后收到 1 包 PIXEL_DATA：`rectLeft/Top/Right/Bottom == small_rect`，dataLen == sw·sh·4，像素全为 demo 小色块红 |
+| `m4_plugin_test` | `MultiPixelPacketOrdering` | 连续两次 `Damage` 触发的两包 PIXEL_DATA 按顺序到达、`frameSeq` 递增 |
+| `apphost_lifecycle_test` | `ConnectAndReady` | AppHost 子进程能连入 fake Gateway 并发出 APPHOST_READY |
+| `apphost_lifecycle_test` | `HeartbeatEcho` | fake Gateway 发 HEARTBEAT，AppHost echo 返回 |
+| `apphost_lifecycle_test` | `CloseSessionExits` | fake Gateway 发 CLOSE_SESSION，AppHost 子进程在 `shutdown_grace` 内自行退出（exit 0） |
+| `apphost_lifecycle_test` | `MultiPacketSendQueue` | 多包顺序发送不丢/不交错（继承自旧 apphost_test 的覆盖） |
+
+**通过标准**：`bazel test //src/apphost:m4_plugin_test //src/apphost:pixel_capture_test //src/apphost:apphost_lifecycle_test` 全部 PASSED。
 
 ---
 
@@ -1198,12 +1284,15 @@ Client 插件使用与 AppHost 插件相同的 GKC 标准接口：
 
 ```cpp
 // plugins/client_viewer/client_viewer.cpp
-// Client 插件同样导出 sa_ui_main，Client 可执行程序通过 dlopen/LoadLibrary 加载
+// Client 插件链接 GKC 的 GkcGui.cpp（gkc_gui_runtime），由它提供
+// extern "C" int _SA_UIMain(...) shim；插件作者只需实现：
 
-extern "C" GKC::SA_UIMain* sa_ui_main();
+namespace program_entry_point {
+    int GuiMain(const GKC::ConstArray<GKC::ConstStringS>& args);
+}
 ```
 
-Client 可执行程序传入的 `IUiHost` 是真实的 GKC UIHost（Wayland / Win32），而不是像 AppHost 那样的假实现。插件在 `Exec()` 内：
+Client 可执行程序通过 `dlsym("_SA_UIMain")` 取入口、构造 `LcInterface<IUiHost>` 指向**真实的 GKC UIHost（Wayland / Win32）**（与 AppHost 的 fake/headless 实现对称），调用 `_SA_UIMain(lcHost, args)`。`_SA_UIMain` shim 把 `lcHost` 写入插件本地的 `g_ui_host`，再调用 `program_entry_point::GuiMain(args)`。`GuiMain` 内：
 1. 从 `args` 解析 Gateway 地址、要启动的 AppHost 插件名
 2. 创建 `ToplevelImpl` 窗口
 3. 通过 IoPool 连接 Gateway，发送 `SPAWN_APP`
@@ -1217,7 +1306,7 @@ Client 可执行程序传入的 `IUiHost` 是真实的 GKC UIHost（Wayland / Wi
 | 文件 | 内容 |
 |------|------|
 | `src/client/client.h/.cpp` | IoPool `StartConnect` 连接 Gateway；MessageHandler 注册 SESSION_ACK / PIXEL_DATA / ERROR_RESP 处理器 |
-| `src/client/plugin_loader.h/.cpp` | `dlopen`（Linux）/ `LoadLibrary`（Windows）加载 `.so`/`.dll`，`dlsym("sa_ui_main")` |
+| `src/client/plugin_loader.h/.cpp` | `dlopen`（Linux）/ `LoadLibrary`（Windows）加载 `.so`/`.dll`，`dlsym("_SA_UIMain")` 取入口，调用 `_SA_UIMain(lcHost, args)` |
 | `src/client/pixel_renderer.h/.cpp` | 线程安全像素缓冲区（mutex 保护），支持脏矩形局部写入；供插件使用 |
 | `src/client/main.cpp` | 解析 `--plugin`、`--gateway-host`、`--gateway-port` 参数；加载插件；调用 `Exec()` |
 | `plugins/client_viewer/client_viewer.cpp` | `ToplevelImpl<ViewerWindow>`：DoDraw 贴像素、DoMouse/DoKeyboard 打包发送、DoClose 退出 |
@@ -1231,8 +1320,8 @@ Client main()
   ↓
 plugin_loader.load("./plugins/client_viewer/libclient_viewer.so")
   ↓
-sa_ui_main() → SA_UIMain::Exec(real_gkc_ui_host, args)
-  ↓
+_SA_UIMain(lcHost{real_gkc_ui_host}, args)
+  ↓ （shim 内：g_ui_host = lcHost; program_entry_point::GuiMain(args)）
 插件创建 ViewerWindow（ToplevelImpl）
   ↓
 IoPool StartConnect → Gateway
@@ -1401,10 +1490,16 @@ Client UI                    -> 根据 session_id 分发到不同窗口/标签�
 - [ ] `ps aux | grep apphost` 无残留进程
 
 ### M4 完成标准
-- [ ] `bazel test //src/apphost:m4_plugin_test` — PASSED
-- [ ] `bazel test //src/apphost:pixel_capture_test` — PASSED
-- [ ] `dirty_rect_detector.h/.cpp` 已从代码库删除
-- [ ] ui_host_impl 使用 pDraw->rcPaint，不保存上一帧
+- [ ] `bazel test //src/apphost:m4_plugin_test` — PASSED（含 `PluginLoadsAndSeesFakeHost` / `InitialFullFrame` / `DirtyRectIsSubset` / `MultiPixelPacketOrdering`）
+- [ ] `bazel test //src/apphost:pixel_capture_test` — PASSED（含 `CaptureRectByteOrder` / `PackPixelDataConvertsBgraToArgb`）
+- [ ] `bazel test //src/apphost:apphost_lifecycle_test` — PASSED（连接 / HEARTBEAT / CLOSE_SESSION / 多包顺序）
+- [ ] `src/apphost/pixel_buffer.h/.cpp` 已删除；窗口像素由 `ui_host_impl::WindowRuntime` 持有 `std::vector<color_quad>`
+- [ ] 旧 `src/apphost/apphost_test.cpp`（M2 静态红帧测试）已替换为上面的 `m4_plugin_test` + `apphost_lifecycle_test`
+- [ ] `ui_host_impl` 使用 `pDraw->rcPaint`，不保存上一帧；`Show(true)` 触发首帧整窗 DRAW，`Damage(rect)` 触发同步局部 DRAW
+- [ ] `plugin_loader` 通过 `dlsym("_SA_UIMain")` 加载入口；`demo_app.so` 入口处 `g_ui_host.GetFunc() != nullptr`
+- [ ] AppHost 二进制不链接 `GkcGui.cpp`；`gkc_gui_runtime` 仅由插件 .so 链接
+- [ ] PIXEL_DATA body 中像素已按 `[A,R,G,B]` 大端排列（与 `pBuffer` 内存中的 `B,G,R,A` 完成转换）
+- [ ] fake host 的 `Quit` 线程安全，可由 IoPool 线程在收到 `CLOSE_SESSION` 时调用，唤醒主线程 `Loop`
 
 ### M5 完成标准
 - [ ] `bazel test //src/apphost:m5_input_test` — 4 个测试用例全部 PASSED

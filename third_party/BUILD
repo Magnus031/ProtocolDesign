@@ -83,3 +83,32 @@ alias(
     }),
     visibility = ["//visibility:public"],
 )
+
+# gkc_plugin_runtime: header-only target that exposes GKC public headers
+# AND the GKC source files (GkcDef.cpp / GkcSAMain.cpp / GkcGui.cpp / system/*.cpp)
+# as textual_hdrs so plugin authors can follow the GKC convention of including
+# them at the bottom of their main .cpp:
+#
+#   namespace GKC { class ProgramEntryPoint { ... GuiMain(args) {...} }; }
+#   #include "base/GkcDef.cpp"
+#   #include "base/GkcSAMain.cpp"
+#   #include "base/GkcGui.cpp"
+#
+# This gives each plugin .so its own copy of GKC::g_ui_host and an exported
+# extern "C" _SA_UIMain symbol that the host can dlsym.
+#
+# Plugins should also depend on :GkcSys for runtime symbols (heap, time,
+# IoPool, real IUiToplevel impls, etc.).  Hosts (apphost_bin) MUST NOT depend
+# on this target — it would give the host its own duplicate g_ui_host that
+# the plugin would never see.
+cc_library(
+    name = "gkc_plugin_runtime",
+    hdrs = glob([
+        "GKC/public/include/**/*.h",
+    ]),
+    textual_hdrs = glob([
+        "GKC/public/include/**/*.cpp",
+    ]),
+    includes = ["GKC/public/include"],
+    visibility = ["//visibility:public"],
+)

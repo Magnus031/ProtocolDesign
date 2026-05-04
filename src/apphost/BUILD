@@ -1,17 +1,49 @@
-# AppHost: IoPool-based TCP server that captures pixel data and handles input events.
-
-cc_library(
-    name = "pixel_buffer",
-    srcs = ["pixel_buffer.cpp"],
-    hdrs = ["pixel_buffer.h"],
-    copts = ["-std=c++17"],
-    visibility = ["//visibility:public"],
-)
+# AppHost: outbound TCP client to Gateway, hosts a single business plugin.
 
 cc_library(
     name = "pixel_capture",
     srcs = ["pixel_capture.cpp"],
     hdrs = ["pixel_capture.h"],
+    deps = [
+        "//src/common:byte_order",
+    ],
+    copts = ["-std=c++17"],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "pixel_capture_test",
+    srcs = ["pixel_capture_test.cpp"],
+    deps = [
+        ":pixel_capture",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+    copts = ["-std=c++17"],
+)
+
+# Headless fake IUiHost.  Hosts (apphost_bin) link this; plugins do NOT.
+cc_library(
+    name = "ui_host_impl",
+    srcs = ["ui_host_impl.cpp"],
+    hdrs = ["ui_host_impl.h"],
+    deps = [
+        ":pixel_capture",
+        "//third_party:GkcSys",
+    ],
+    copts = ["-std=c++17"],
+    visibility = ["//visibility:public"],
+)
+
+# dlopen/dlsym wrapper for SA UI plugins.  Hosts only.
+cc_library(
+    name = "plugin_loader",
+    srcs = ["plugin_loader.cpp"],
+    hdrs = ["plugin_loader.h"],
+    deps = [
+        "//third_party:GkcSys",
+    ],
+    linkopts = ["-ldl"],
     copts = ["-std=c++17"],
     visibility = ["//visibility:public"],
 )
@@ -21,11 +53,10 @@ cc_library(
     srcs = ["apphost.cpp"],
     hdrs = ["apphost.h"],
     deps = [
-        ":pixel_buffer",
-        ":pixel_capture",
+        ":plugin_loader",
+        ":ui_host_impl",
         "//src/common:message_handler",
         "//src/protocol:protocol",
-        "//third_party:GkcSys",
     ],
     copts = ["-std=c++17"],
     visibility = ["//visibility:public"],
@@ -36,22 +67,44 @@ cc_binary(
     srcs = ["main.cpp"],
     deps = [
         ":apphost",
-        "//src/protocol:message_parser",
-        "//src/protocol:protocol",
     ],
     copts = ["-std=c++17"],
     visibility = ["//visibility:public"],
 )
 
+# End-to-end: fake Gateway + apphost subprocess + demo plugin.
 cc_test(
-    name = "apphost_test",
-    srcs = ["apphost_test.cpp"],
+    name = "m4_plugin_test",
+    srcs = ["m4_plugin_test.cpp"],
+    data = [
+        ":apphost_bin",
+        "//plugins/demo_app:libdemo_app.so",
+    ],
     deps = [
-        ":apphost",
-        "//src/protocol:protocol",
         "//src/protocol:message_parser",
+        "//src/protocol:protocol",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],
     copts = ["-std=c++17"],
+    timeout = "short",
+)
+
+# Network-layer lifecycle: APPHOST_READY, HEARTBEAT echo, CLOSE_SESSION,
+# multi-packet ordering.  Inherits the role of the old apphost_test (M2).
+cc_test(
+    name = "apphost_lifecycle_test",
+    srcs = ["apphost_lifecycle_test.cpp"],
+    data = [
+        ":apphost_bin",
+        "//plugins/demo_app:libdemo_app.so",
+    ],
+    deps = [
+        "//src/protocol:message_parser",
+        "//src/protocol:protocol",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+    copts = ["-std=c++17"],
+    timeout = "short",
 )

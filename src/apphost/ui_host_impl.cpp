@@ -52,6 +52,20 @@ struct UiHostImpl::State {
     bool                          quit_flag = false;
     std::deque<PostedWork>        post_queue;
 
+    // Owns-data input queue (M5).  AppHost reader thread copies parsed
+    // GKC::UiMessageMouse / UiMessageKeyboard values into this queue, then
+    // schedules a single drain_input_work_static onto post_queue.  Sharing
+    // one pending WorkProc across a burst keeps post_queue from growing
+    // 1:1 with input events.
+    struct InputEvent {
+        enum class Kind : uint8_t { Mouse, Keyboard };
+        Kind                       kind = Kind::Mouse;
+        GKC::UiMessageMouse        mouse{};
+        GKC::UiMessageKeyboard     keyboard{};
+    };
+    std::deque<InputEvent>        input_queue;
+    bool                          input_work_pending = false;
+
     // Pixel sink: receives finished PIXEL_DATA Body bytes per frame.
     PixelDataSink                 sink;
 
@@ -332,4 +346,79 @@ GKC::LcInterface<IUiHost> UiHostImpl::make_interface() {
 
 void UiHostImpl::request_quit() {
     on_host_quit(this);
+}
+
+void UiHostImpl::post_mouse_input(const GKC::UiMessageMouse& msg) {
+    bool should_post = false;
+    {
+        std::lock_guard<std::mutex> lk(state_->mtx);
+        State::InputEvent ev{};
+        ev.kind  = State::InputEvent::Kind::Mouse;
+        ev.mouse = msg;  // value copy; caller's stack object may disappear.
+        state_->input_queue.push_back(ev);
+        if (!state_->input_work_pending) {
+            state_->input_work_pending = true;
+            should_post = true;
+        }
+    }
+    if (should_post)
+        on_host_post_work(this, WorkProc{&UiHostImpl::drain_input_work_static}, this);
+}
+
+void UiHostImpl::post_keyboard_input(const GKC::UiMessageKeyboard& msg) {
+    bool should_post = false;
+    {
+        std::lock_guard<std::mutex> lk(state_->mtx);
+        State::InputEvent ev{};
+        ev.kind     = State::InputEvent::Kind::Keyboard;
+        ev.keyboard = msg;  // value copy.
+        state_->input_queue.push_back(ev);
+        if (!state_->input_work_pending) {
+            state_->input_work_pending = true;
+            should_post = true;
+        }
+    }
+    if (should_post)
+        on_host_post_work(this, WorkProc{&UiHostImpl::drain_input_work_static}, this);
+}
+
+void UiHostImpl::drain_input_work_static(void* self) noexcept {
+    static_cast<UiHostImpl*>(self)->drain_input_queue_on_main_thread();
+}
+
+void UiHostImpl::drain_input_queue_on_main_thread() {
+    // Snapshot under the lock so plugin DoMouse/DoKeyboard (which may call
+    // Damage and trigger synchronous DoDraw + PIXEL_DATA send) runs without
+    // any host-side mutex held.
+    std::deque<State::InputEvent> local;
+    {
+        std::lock_guard<std::mutex> lk(state_->mtx);
+        std::swap(local, state_->input_queue);
+        state_->input_work_pending = false;
+    }
+
+    while (!local.empty()) {
+        const State::InputEvent ev = local.front();
+        local.pop_front();
+        if (ev.kind == State::InputEvent::Kind::Mouse)
+            dispatch_mouse(ev.mouse);
+        else
+            dispatch_keyboard(ev.keyboard);
+    }
+}
+
+void UiHostImpl::dispatch_mouse(const GKC::UiMessageMouse& msg) noexcept {
+    auto* w = state_->window.get();
+    if (w == nullptr || w->destroyed) return;
+    if (w->handler.Process == nullptr) return;
+    w->handler.Process(w->handler_ctx, UI_MESSAGE_MOUSE,
+                       reinterpret_cast<uintptr>(&msg));
+}
+
+void UiHostImpl::dispatch_keyboard(const GKC::UiMessageKeyboard& msg) noexcept {
+    auto* w = state_->window.get();
+    if (w == nullptr || w->destroyed) return;
+    if (w->handler.Process == nullptr) return;
+    w->handler.Process(w->handler_ctx, UI_MESSAGE_KEYBOARD,
+                       reinterpret_cast<uintptr>(&msg));
 }

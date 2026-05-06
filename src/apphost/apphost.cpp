@@ -16,6 +16,7 @@
 #include "src/apphost/apphost.h"
 #include "src/apphost/plugin_loader.h"
 #include "src/apphost/ui_host_impl.h"
+#include "src/common/input_event.h"
 #include "src/common/message_handler.h"
 #include "src/protocol/protocol.h"
 
@@ -128,15 +129,33 @@ struct AppHost::Impl {
         }
 
         // Plugin handlers.  The reader thread feeds the parser and dispatches
-        // these synchronously on the reader thread — fine for HEARTBEAT
-        // (a quick echo send) and CLOSE_SESSION (just sets a flag); INPUT_EVENT
-        // is dropped in M4.
+        // these synchronously on the reader thread. HEARTBEAT is a quick echo,
+        // CLOSE_SESSION only asks the UI loop to quit, and INPUT_EVENT is
+        // parsed here but posted to UiHostImpl for main-thread delivery.
         handler_.register_handler(CmdType::HEARTBEAT,
             [this](const Packet&) { send_heartbeat(); });
         handler_.register_handler(CmdType::CLOSE_SESSION,
             [this](const Packet&) { ui_host_.request_quit(); });
+        // INPUT_EVENT (M5): the reader thread is NOT allowed to call into the
+        // plugin handler directly — plugin DoMouse/DoKeyboard must run on the
+        // main thread that owns the GKC backing store and synchronously emits
+        // PIXEL_DATA via Damage().  We parse the Body here and hand the event
+        // to UiHostImpl, which copies it into an owns-data queue and uses
+        // PostWork to ship it to the main thread.
+        //
+        // Invalid Body shapes (empty / unknown eventType / wrong length /
+        // keyCode > 255) are silently dropped per §5.1.1 — input is data
+        // plane, a malformed packet must not kill the session.
         handler_.register_handler(CmdType::INPUT_EVENT,
-            [](const Packet&) { /* M4: ignored; M5 will PostWork into plugin */ });
+            [this](const Packet& pkt) {
+                ParsedInputEvent ev;
+                if (!parse_input_event_body(pkt.body.data(), pkt.body.size(), ev))
+                    return;
+                if (ev.kind == ParsedInputEvent::Kind::Mouse)
+                    ui_host_.post_mouse_input(ev.mouse);
+                else
+                    ui_host_.post_keyboard_input(ev.keyboard);
+            });
 
         // Pixel sink: wire up the PIXEL_DATA output channel before the plugin
         // starts rendering.  The chain inside UiHostImpl is:

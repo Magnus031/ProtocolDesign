@@ -70,12 +70,49 @@ public:
     // Wake up Loop() from any thread.  Idempotent.
     void request_quit();
 
+    // Post an input event from any thread (typically the AppHost reader
+    // thread) to be dispatched on the plugin main thread.
+    //
+    // The event is *copied by value* into an internal owns-data queue
+    // before this function returns, so callers may pass stack-local
+    // GKC::UiMessageMouse / GKC::UiMessageKeyboard objects safely.
+    //
+    // The first event after a quiet period schedules a single PostWork
+    // drain.  Subsequent events that arrive before the drain runs share
+    // that same PostWork — we never enqueue a second one while one is
+    // pending.  This keeps the WorkProc count bounded under bursts.
+    //
+    // Plugin DoMouse/DoKeyboard runs on the main thread inside
+    // on_host_loop().  If the window has not been created yet, or has
+    // already been destroyed, or has no handler installed, the event is
+    // silently dropped.  M5 must NOT crash on input that arrives outside
+    // a fully-wired plugin window.
+    void post_mouse_input(const GKC::UiMessageMouse& msg);
+    void post_keyboard_input(const GKC::UiMessageKeyboard& msg);
+
     // State is the implementation struct.  It is declared public so the
     // file-static IUiHost dispatch callbacks in ui_host_impl.cpp can name
     // its nested types directly.  External code does not depend on it.
     struct State;
 
 private:
+    // WorkProc trampoline used by post_mouse_input / post_keyboard_input
+    // to schedule drain_input_queue_on_main_thread() onto the main thread
+    // through PostWork.  The first argument is the UiHostImpl*.
+    static void drain_input_work_static(void* self) noexcept;
+
+    // Main-thread drain of the input queue.  Swaps the pending events into
+    // a local container before releasing the state mutex, then dispatches
+    // each one — plugin DoDraw triggered by Damage() inside the dispatch
+    // path must not see the host mutex held.
+    void drain_input_queue_on_main_thread();
+
+    // Synchronous dispatch into the plugin's UiMessageHandler.  Must only
+    // be called from the main thread (i.e. from drain_input_queue_on_main_
+    // thread()).  Drops events when the window has no handler yet.
+    void dispatch_mouse(const GKC::UiMessageMouse& msg) noexcept;
+    void dispatch_keyboard(const GKC::UiMessageKeyboard& msg) noexcept;
+
     std::unique_ptr<State> state_;
 
     // UiHostImplCallbacks is a "friend bridge": it grants the 15 or so

@@ -55,6 +55,7 @@ cc_library(
     deps = [
         ":plugin_loader",
         ":ui_host_impl",
+        "//src/common:input_event",
         "//src/common:message_handler",
         "//src/protocol:protocol",
     ],
@@ -100,6 +101,25 @@ cc_test(
         "//plugins/demo_app:libdemo_app.so",
     ],
     deps = [
+        "//src/protocol:message_parser",
+        "//src/protocol:protocol",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+    copts = ["-std=c++17"],
+    timeout = "short",
+)
+
+# M5: INPUT_EVENT closed loop via fake Gateway + real apphost_bin + demo plugin.
+cc_test(
+    name = "m5_input_test",
+    srcs = ["m5_input_test.cpp"],
+    data = [
+        ":apphost_bin",
+        "//plugins/demo_app:libdemo_app.so",
+    ],
+    deps = [
+        "//src/common:input_event",
         "//src/protocol:message_parser",
         "//src/protocol:protocol",
         "@googletest//:gtest",

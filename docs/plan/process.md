@@ -1677,9 +1677,31 @@ bazel test //src/apphost:m5_input_test \
 
 ---
 
-## M6 — GKC Client（客户端插件加载器）
+## M6 — Windows/GKC Client（真实 GUI 插件加载器 + 端到端联调）
 
-**目标**：Client 与 AppHost 完全对称——也是一个通用插件加载器。Client 可执行程序加载 `.so`（Linux）/ `.dll`（Windows）客户端插件，插件负责创建 GKC 窗口、渲染像素、采集输入并发送。完成完整端到端可视化测试。
+**目标**：把 M5 的 fake Client 替换成真实 GKC GUI Client。用户在 Windows 上运行
+`client.exe`，Client 加载自己的 `client_viewer.dll`，连接 Gateway 暴露的 public
+port，发送 `SPAWN_APP("demo_app")`，接收 AppHost 返回的 `PIXEL_DATA` 并显示到真实
+Win32/GKC 窗口；用户在窗口中的鼠标/键盘输入被打包为 `INPUT_EVENT` 发回 Gateway，
+最终驱动 AppHost 插件状态变化并刷新窗口。
+
+> **关键架构约定**：AppHost 端使用我们自己实现的 fake/headless `ui_host_impl`，因为
+> AppHost 是 UI 虚拟化宿主，不需要真实屏幕，只需要内存 backing store 和 `rcPaint`
+> 捕获。Client 端不再实现 fake host，而是直接使用 GKC 自带的真实 GUI host。GKC 的
+> `util/gui/uihost` 已经同时有 Linux Wayland 与 Windows Win32 适配：`uihost/src/Main.cpp`
+> 初始化 `g_win_ui_host`，再把 `LcInterface<IUiHost>(&g_win_ui_host, &g_ui_host_interface)`
+> 注入插件 `_SA_UIMain`。M6 可以复用这个模式，或把这套真实 GUI host 封装进
+> `client.exe`。
+
+M6 建议拆成三个阶段，避免把跨平台构建、真实 GUI、网络闭环、2048 业务逻辑混在一起：
+
+| 阶段 | 目标 | 通过标准 |
+|------|------|----------|
+| M6a | Windows/GKC GUI 基础与插件加载 | `client.exe` 能在 Windows 上加载 `client_viewer.dll`，创建真实窗口，显示本地测试图案，正常退出 |
+| M6b | Client 网络 viewer 闭环 | `client.exe + client_viewer.dll` 能连接 Gateway，显示 `demo_app` 的 PIXEL_DATA，并把鼠标/`KB_F1` 输入发回 AppHost |
+| M6c | 2048 AppHost demo | 新增或替换服务端 2048 插件，Client 发送方向键后窗口中的 2048 状态可交互更新 |
+
+M6a/M6b 是本 milestone 的主线；M6c 可以紧随其后做，但不应阻塞 M6 基础闭环验收。
 
 ### 6.1 Client 插件接口
 
@@ -1695,45 +1717,78 @@ namespace program_entry_point {
 }
 ```
 
-Client 可执行程序通过 `dlsym("_SA_UIMain")` 取入口、构造 `LcInterface<IUiHost>` 指向**真实的 GKC UIHost（Wayland / Win32）**（与 AppHost 的 fake/headless 实现对称），调用 `_SA_UIMain(lcHost, args)`。`_SA_UIMain` shim 把 `lcHost` 写入插件本地的 `g_ui_host`，再调用 `program_entry_point::GuiMain(args)`。`GuiMain` 内：
-1. 从 `args` 解析 Gateway 地址、要启动的 AppHost 插件名
-2. 创建 `ToplevelImpl` 窗口
-3. 通过 IoPool 连接 Gateway，发送 `SPAWN_APP`
-4. 在 IoPool 回调中（通过 `MessageHandler`）接收 `PIXEL_DATA`，写入本地缓冲区，`PostWork()` 触发重绘
-5. 在 `DoDraw` 中把缓冲区 `memcpy` 到 `pDraw->pBuffer`
-6. 在 `DoMouse` / `DoKeyboard` 中打包事件发往 Gateway
-7. 进入 `GuiHelper::Loop()`
+`client_viewer.dll` / `.so` 与 AppHost 插件一样链接 GKC 的 plugin-side runtime
+（`GkcDef.cpp` / `GkcSAMain.cpp` / `GkcGui.cpp`），由它导出 `_SA_UIMain` 并持有插件本地
+`GKC::g_ui_host`。区别在于宿主传入的 `IUiHost`：
+
+| 组件 | 宿主传入的 `IUiHost` | 目的 |
+|------|----------------------|------|
+| AppHost | 我们的 `ui_host_impl` fake/headless host | 捕获 `DoDraw` 输出，打包 `PIXEL_DATA` |
+| Client | GKC 真实 GUI host（Windows Win32 / Linux Wayland） | 创建真实窗口，接收本地鼠标键盘，显示像素 |
+
+Client 可执行程序通过 `LoadLibrary` / `dlopen` 加载 viewer 插件，通过
+`GetProcAddress` / `dlsym("_SA_UIMain")` 取入口，构造真实 GKC GUI `LcInterface<IUiHost>`，
+调用 `_SA_UIMain(lcHost, args)`。`_SA_UIMain` shim 把 `lcHost` 写入插件本地
+`g_ui_host`，再调用 `ProgramEntryPoint::GuiMain(args)`。
+
+`GuiMain(args)` 内建议只做 UI 层编排：
+1. 从 `args` 解析 Gateway 地址、端口、要启动的 AppHost appName（默认 `demo_app`）。
+2. 创建 `ViewerWindow : ToplevelImpl<ViewerWindow>`。
+3. 通过 Client runtime 连接 Gateway 并发送 `SPAWN_APP(appName)`。
+4. `ViewerWindow.Show(true)` 后进入 `GuiHelper::Loop()`。
+5. `DoDraw` 从 `PixelRenderer` blit 到 `pDraw->pBuffer`。
+6. `DoMouse` / `DoKeyboard` 调用 Client runtime 发送 `INPUT_EVENT`。
+
+> 职责边界：`client_viewer` 负责真实窗口与用户输入；`src/client` 负责网络连接、
+> `MessageHandler`、`PixelRenderer`、向插件暴露发送输入/触发重绘的 runtime API。
 
 ### 6.2 需要实现的文件
 
 | 文件 | 内容 |
 |------|------|
-| `src/client/client.h/.cpp` | IoPool `StartConnect` 连接 Gateway；MessageHandler 注册 SESSION_ACK / PIXEL_DATA / ERROR_RESP 处理器 |
-| `src/client/plugin_loader.h/.cpp` | `dlopen`（Linux）/ `LoadLibrary`（Windows）加载 `.so`/`.dll`，`dlsym("_SA_UIMain")` 取入口，调用 `_SA_UIMain(lcHost, args)` |
-| `src/client/pixel_renderer.h/.cpp` | 线程安全像素缓冲区（mutex 保护），支持脏矩形局部写入；供插件使用 |
-| `src/client/main.cpp` | 解析 `--plugin`、`--gateway-host`、`--gateway-port` 参数；加载插件；调用 `Exec()` |
-| `plugins/client_viewer/client_viewer.cpp` | `ToplevelImpl<ViewerWindow>`：DoDraw 贴像素、DoMouse/DoKeyboard 打包发送、DoClose 退出 |
-| `plugins/client_viewer/BUILD` | 构建为 `.so`（Linux）/ `.dll`（Windows）共享库 |
-| `src/client/m6_client_test.cpp` | headless 集成测试：不启动 GKC GUI 循环，只验证协议收发 |
+| `third_party/BUILD` | 补齐 Windows GKC runtime / GUI host 目标；`GkcSys` 已有 Linux/Windows `select`，M6 还需要真实 GUI host 或等价封装目标 |
+| `src/client/plugin_loader.h/.cpp` | `LoadLibrary`（Windows）/ `dlopen`（Linux）加载 `.dll`/`.so`，取 `_SA_UIMain`，调用入口 |
+| `src/client/client_runtime.h/.cpp` 或 `client.h/.cpp` | Client 网络 runtime：连接 Gateway，发送 `SPAWN_APP` / `INPUT_EVENT`，接收 `SESSION_ACK` / `PIXEL_DATA` / `ERROR_RESP` |
+| `src/client/pixel_renderer.h/.cpp` | 线程安全像素缓冲区；支持 `PIXEL_DATA` dirty rect apply、frameSeq 过滤、`DoDraw` blit |
+| `src/client/main.cpp` | Windows `client.exe` 入口；解析 `--plugin/--gateway-host/--gateway-port/--app`；初始化真实 GKC GUI host；加载 viewer 插件 |
+| `plugins/client_viewer/client_viewer.cpp` | `ToplevelImpl<ViewerWindow>`：创建窗口、DoDraw 贴像素、DoMouse/DoKeyboard 调用 runtime 发送输入、DoClose 退出 |
+| `plugins/client_viewer/BUILD` | 构建 Linux `.so` / Windows `.dll`；链接 plugin-side GKC runtime；输出名便于手动运行 |
+| `src/client/pixel_renderer_test.cpp` | headless 单元测试：dirty rect apply、越界/长度校验、frameSeq 过滤、blit |
+| `src/client/m6_client_test.cpp` | headless 协议测试：fake Gateway 验证 SPAWN_APP、SESSION_ACK、PIXEL_DATA apply、INPUT_EVENT pack/send |
+| `docs/design/M6.md` | M6 完成后记录 Windows 运行方式、GKC GUI host 链接方式、手动联调步骤 |
 
 ### 6.3 Client 插件加载流程
 
 ```
-Client main()
+client.exe main()
   ↓
-plugin_loader.load("./plugins/client_viewer/libclient_viewer.so")
+初始化或封装 GKC real UIHost
+  Windows: Win32 host（GKC util/gui/uihost 的 _system_/Windows 实现）
+  Linux: Wayland host（可选，用于本地 Linux 手动验证）
+  ↓
+plugin_loader.load("client_viewer.dll")
   ↓
 _SA_UIMain(lcHost{real_gkc_ui_host}, args)
   ↓ （shim 内：g_ui_host = lcHost; program_entry_point::GuiMain(args)）
 插件创建 ViewerWindow（ToplevelImpl）
   ↓
-IoPool StartConnect → Gateway
+Client runtime StartConnect → Gateway public_port
   ↓
-发送 SPAWN_APP("demo_app")
+发送 SPAWN_APP(appName，默认 "demo_app")
   ↓
 收到 SESSION_ACK → 开始接收 PIXEL_DATA
   ↓
 ViewerWindow.Show(true) + GuiHelper::Loop()
+```
+
+运行示例（Windows）：
+
+```
+client.exe ^
+  --plugin=.\plugins\client_viewer\client_viewer.dll ^
+  --gateway-host=<gateway-ip> ^
+  --gateway-port=19000 ^
+  --app=demo_app
 ```
 
 ### 6.4 GKC 窗口绘制与输入流程（插件内）
@@ -1751,22 +1806,63 @@ DoDraw(pDraw)
     → PixelRenderer.blit(pDraw->pBuffer, pDraw->iWidth, pDraw->rcPaint)
 
 DoMouse(pMouse)
-    → 序列化 MOUSE_EVENT Body（直接用 pMouse->uEvent, x, y）
-    → IoPool BeginInput/EndInput 发往 Gateway
+    → 将 GKC 鼠标消息映射为 InputEventType
+        MOUSE_EVENT_MOVE                      → MOUSE_MOVE
+        MOUSE_EVENT_DOWN + MOUSE_BUTTON_LEFT  → MOUSE_LEFT_DOWN
+        MOUSE_EVENT_UP   + MOUSE_BUTTON_LEFT  → MOUSE_LEFT_UP
+        MOUSE_EVENT_DOWN + MOUSE_BUTTON_RIGHT → MOUSE_RIGHT_DOWN
+        MOUSE_EVENT_UP   + MOUSE_BUTTON_RIGHT → MOUSE_RIGHT_UP
+        MOUSE_EVENT_WHEEL                     → MOUSE_SCROLL（M6 仍无 delta）
+    → 使用 src/common/input_event.h 的 pack_mouse_input_event()
+    → Client runtime 发送 CmdType::INPUT_EVENT 到 Gateway
 
 DoKeyboard(pKb)
-    → 序列化 KEYBOARD_EVENT Body（直接用 pKb->btKey, btState, btDown）
-    → IoPool BeginInput/EndInput 发往 Gateway
+    → pKb->btDown ? KEY_DOWN : KEY_UP
+    → keyCode = pKb->btKey（仍只传 btKey，不传 chFull）
+    → 使用 pack_keyboard_input_event()
+    → Client runtime 发送 CmdType::INPUT_EVENT 到 Gateway
 ```
+
+> M6 仍不实现可打印字符输入协议扩展。2048 和 M5 demo 都只需要 `btKey`
+> 方向键 / `KB_F1`，不依赖 Space 或 `chFull`。
 
 ### 6.5 测试要求
 
 | 测试类型 | 测试用例 | 期望结果 |
 |----------|----------|----------|
-| 自动化集成 | `m6_client_test` | PIXEL_DATA 正确写入 PixelRenderer，FRAME_ACK 正确发送 |
-| 手动端到端 | Gateway + AppHost(demo_app) + Client(client_viewer) | 窗口显示蓝色背景，鼠标点击颜色切换，键盘 `KB_F1` 切换颜色，稳定运行 60 秒无 crash |
+| 自动化单元 | `pixel_renderer_test` | dirty rect 正确写入缓冲区；旧 frameSeq 可丢弃；错误长度/越界不 crash |
+| 自动化 headless | `m6_client_test` | fake Gateway 下 Client 发送 `SPAWN_APP`，接收 `SESSION_ACK/PIXEL_DATA`，PixelRenderer 更新，输入事件 pack/send 正确 |
+| 手动端到端 M6b | Windows `client.exe` + `client_viewer.dll` + Gateway + AppHost(demo_app) | 窗口显示蓝色背景，鼠标点击小矩形切色，键盘 `KB_F1` 切换背景，稳定运行 60 秒无 crash |
+| 手动端到端 M6c | Windows `client.exe` + `client_viewer.dll` + Gateway + AppHost(2048) | 方向键能操作 2048，窗口画面随服务端状态更新 |
 
-**通过标准**：自动化测试 PASSED + 手动 60 秒稳定运行。
+**通过标准（M6 主线）**：`pixel_renderer_test` + `m6_client_test` PASSED；Windows 手动端到端
+demo_app 稳定运行 60 秒；`client_viewer.dll` 可替换，Client 不把 demo_app 业务逻辑写死。
+
+### 6.6 GKC / Bazel 跨平台前置工作
+
+M6 的主要风险不在协议，而在 Windows 构建与 GKC GUI host 接入。开工前需要明确：
+
+| 项目 | 要求 |
+|------|------|
+| `GkcSys_windows` | 当前 `third_party/BUILD` 已通过 `cc_import` 指向 `GKC_BUILD/release/bin/Release/GkcSys.dll/.lib`；需要确认 Windows 构建产物路径稳定，并放入 Bazel runfiles / 发布目录 |
+| real GUI host | GKC `util/gui/uihost` 已有 Windows `_system_/Windows` 实现；M6 需要选择：直接构建/复用 `uihost.exe`，或把 `g_win_ui_host + g_ui_host_interface` 封装到 `client.exe` |
+| plugin runtime | `client_viewer.dll` 必须像 `demo_app.so` 一样拥有插件本地 `g_ui_host` 和 `_SA_UIMain`；Client exe 不应错误链接出另一份 plugin-side `g_ui_host` 并让插件拿不到注入 |
+| BUILD select | `src/client`、`plugins/client_viewer`、`third_party` 需要 Linux/Windows `select()`：Linux 输出 `.so`，Windows 输出 `.dll/.exe`，并处理 `LoadLibrary` / `dlopen` 差异 |
+| 手动运行包 | Windows 运行目录至少包含 `client.exe`、`client_viewer.dll`、`GkcSys.dll`、必要 MSVC runtime，以及可访问的 Gateway IP/port |
+
+### 6.7 2048 与 M6 的关系
+
+2048 不应作为 M6a/M6b 的阻塞项。M6b 跑通 demo_app 后，2048 的网络/显示/输入基础已经具备；
+剩余工作主要是 AppHost 业务插件：
+
+- 新增 `plugins/app_2048`（或后续替换 demo_app）。
+- 服务端维护 4×4 board、score、随机生成 tile、game over 状态。
+- `DoKeyboard` 响应 `KB_Left/KB_Right/KB_Up/KB_Down`，状态变化后 `Damage(full window)`。
+- `DoDraw` 绘制棋盘、方块和数字；初版可使用简单 bitmap 数字或色块，先不做复杂字体。
+- Gateway allowlist 增加 `app_2048`，Client 用 `--app=app_2048` 启动。
+
+因此 PM 拆分建议是：先完成 M6b 的通用 viewer，再做 M6c/后续 2048。这样如果 2048
+画面不对，问题集中在游戏插件；如果 demo_app 都跑不通，问题集中在 Client/GKC/网络链路。
 
 ---
 

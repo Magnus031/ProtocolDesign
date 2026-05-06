@@ -1201,76 +1201,479 @@ void Quit(void*) {
 
 ## M5 — 完整输入事件闭环 + 多线程 PostWork 模型
 
-**目标**：打通 `INPUT_EVENT`（鼠标和键盘）从 Client → Gateway → AppHost → 插件的完整路径。在 AppHost 中明确实现 IoPool 线程 → `PostWork()` → 主线程 → 插件事件注入的多线程安全模式。
+**目标**：在 M4 的“插件能绘制并发送 PIXEL_DATA”基础上，补齐反向输入链路：`INPUT_EVENT` 从 Client/TestClient 经 Gateway 路由到 AppHost，AppHost 在网络线程中解析事件，但必须通过 `PostWork()` 切回插件主线程，再注入 `UI_MESSAGE_MOUSE` / `UI_MESSAGE_KEYBOARD`，最终触发插件的 `DoMouse()` / `DoKeyboard()`，插件状态变化后调用 `Damage()`，产生新的 `PIXEL_DATA`。
+
+> 术语说明：M3/M4 计划里常写“IoPool 线程”。当前 M4 AppHost 实现实际是一个 blocking socket `reader_` 线程，而不是 GKC IoPool。M5 的线程约束不依赖具体 I/O 实现，准确表述应是：**network reader thread → PostWork queue → plugin main thread**。后续如果 AppHost 再切回 GKC IoPool，这个线程边界仍然成立。
+
+### 5.0 M5 与 M4 的差异
+
+M4 完成的是**插件主动绘制**：
+
+```
+plugin GuiMain()
+  ├── win.Show(true)
+  │     └── fake host dispatch UI_MESSAGE_DRAW
+  │           └── plugin DoDraw()
+  │                 └── AppHost packs PIXEL_DATA
+  └── win.Damage(rect)
+        └── same path
+```
+
+M5 要完成的是**外部输入驱动绘制**：
+
+```
+TestClient / future Client
+  └── INPUT_EVENT(mouse / keyboard)
+        ↓
+Gateway
+  └── route by SessionID, do not parse Body
+        ↓
+AppHost reader thread
+  └── parse INPUT_EVENT Body
+  └── PostWork(inject_mouse / inject_keyboard)
+        ↓
+AppHost plugin main thread
+  └── ui_host_impl.dispatch_mouse/keyboard()
+        ↓
+demo_app plugin
+  └── DoMouse / DoKeyboard changes state
+  └── Damage(rect)
+        ↓
+DoDraw → PIXEL_DATA
+```
+
+因此 M5 的核心不是“再发一包 PIXEL_DATA”，而是证明**远端输入可以安全地跨线程进入插件 UI 逻辑并驱动重绘**。
 
 ### 5.1 输入事件协议 Body 格式
 
-所有输入事件共用 `CmdType::INPUT_EVENT = 0x20`，Body 首字节 `eventType` 区分鼠标与键盘：
+所有输入事件共用 `CmdType::INPUT_EVENT = 0x20`，Header 的 `session_id` 仍由 Gateway 用于路由。Gateway 不解析 Body；Body 首字节 `eventType` 只由 Client/AppHost 端解释。
 
 **鼠标事件 Body（13 字节，eventType = 0x01~0x06）：**
 
 ```
 ┌──────────────┬──────────────────┬──────────────────┬──────────────────┐
 │ eventType    │ x                │ y                │ timestamp        │
-│ (1 byte)     │ (4 bytes BE)     │ (4 bytes BE)     │ (8 bytes BE)     │
+│ (1 byte)     │ (4 bytes BE32)   │ (4 bytes BE32)   │ (8 bytes BE64)   │
 └──────────────┴──────────────────┴──────────────────┴──────────────────┘
 eventType: MOVE=0x01, LEFT_DOWN=0x02, LEFT_UP=0x03,
            RIGHT_DOWN=0x04, RIGHT_UP=0x05, SCROLL=0x06
 ```
+
+字段语义：
+
+| 字段 | 说明 |
+|------|------|
+| `eventType` | 鼠标子类型 |
+| `x`, `y` | Client 窗口坐标，M5 不做 DPI/缩放映射，直接传给 GKC `UiMessageMouse::x/y` |
+| `timestamp` | Client 侧产生事件的单调时间戳，单位为微秒，`uint64_t` 大端序；M5 解析但 AppHost demo 不依赖 |
+
+映射到 GKC `UiMessageMouse`：
+
+| 协议事件 | GKC 字段建议 |
+|----------|--------------|
+| `MOVE` | `uEvent=MOUSE_EVENT_MOVE`, `btButton=MOUSE_BUTTON_NONE` |
+| `LEFT_DOWN` | `uEvent=MOUSE_EVENT_DOWN`, `btButton=MOUSE_BUTTON_LEFT`, `btState` 包含 `MOUSE_STATE_LEFT` |
+| `LEFT_UP` | `uEvent=MOUSE_EVENT_UP`, `btButton=MOUSE_BUTTON_LEFT`, `btState` 清除 left |
+| `RIGHT_DOWN` | `uEvent=MOUSE_EVENT_DOWN`, `btButton=MOUSE_BUTTON_RIGHT`, `btState` 包含 `MOUSE_STATE_RIGHT` |
+| `RIGHT_UP` | `uEvent=MOUSE_EVENT_UP`, `btButton=MOUSE_BUTTON_RIGHT`, `btState` 清除 right |
+| `SCROLL` | `uEvent=MOUSE_EVENT_WHEEL`；当前协议没有 wheel delta，M5 可先置 `btValue=0` 或暂不覆盖测试 |
+
+> GKC 当前结构见 `third_party/GKC/public/include/base/system/ui_types.h`：`ui_message_mouse { uint uEvent; byte btButton; byte btState; byte btDouble; byte btValue; int x, y; }`。M5 实现时必须按真实字段构造，不能只按伪代码猜字段名。
 
 **键盘事件 Body（11 字节，eventType = 0x10~0x11）：**
 
 ```
 ┌──────────────┬──────────────────┬──────────────────┐
 │ eventType    │ keyCode          │ timestamp        │
-│ (1 byte)     │ (2 bytes BE)     │ (8 bytes BE)     │
+│ (1 byte)     │ (2 bytes BE16)   │ (8 bytes BE64)   │
 └──────────────┴──────────────────┴──────────────────┘
 eventType: KEY_DOWN=0x10, KEY_UP=0x11
-keyCode: GKC KB_* 枚举值，直接从 DoKeyboard(pKb->btKey) 填入，无需映射
+keyCode: GKC UiMessageKeyboard::btKey 值，直接从 DoKeyboard(pKb->btKey) 填入，无需映射
 ```
+
+字段语义：
+
+| 字段 | 说明 |
+|------|------|
+| `eventType` | `KEY_DOWN` 或 `KEY_UP` |
+| `keyCode` | GKC `UiMessageKeyboard::btKey` 值。`btKey` 是 `byte`，M5 必须校验 `keyCode <= 255`；超出范围直接丢弃，不截断 |
+| `timestamp` | Client 侧事件时间戳，单位为微秒，`uint64_t` 大端序；M5 解析但 demo 不依赖 |
+
+映射到 GKC `UiMessageKeyboard`：
+
+| 协议事件 | GKC 字段建议 |
+|----------|--------------|
+| `KEY_DOWN` | `btDown=1`, `btKey=keyCode`, `btState=0`, `btValue=0`, `chFull=0` |
+| `KEY_UP` | `btDown=0`, `btKey=keyCode`, `btState=0`, `btValue=0`, `chFull=0` |
+
+> GKC 当前结构：`ui_message_keyboard { byte btDown; byte btKey; byte btState; byte btValue; char_f chFull; }`。`btKey` 承载 `KB_Left`、`KB_F1` 等 `KB_*` / 虚拟键码；Space 这类可打印字符走 `chFull`，而 M5 键盘协议不传 `chFull`，因此 M5 demo/测试不要使用 Space。测试重点改为 `KB_F1` 或 `KB_Left` 这类真实 `btKey` 值。
+
+### 5.1.1 协议 helper 与错误处理
+
+M5 应避免在测试和 AppHost 中重复手写位移解析。建议新增轻量 helper：
+
+| 位置 | 内容 |
+|------|------|
+| `src/common/input_event.h` | `enum class InputEventType`，`parse_input_event_body()`，`pack_mouse_input_event()`，`pack_keyboard_input_event()`；作为协议 helper 与 `message_handler.h` 同级，不放入核心 `protocol.h/.cpp` |
+| 测试 helper | 可以复用生产 pack helper，减少 Body 字节布局不一致 |
+
+解析策略：
+
+| 情况 | 处理 |
+|------|------|
+| Body 为空 | 丢弃，不 crash |
+| `eventType` 未知 | 丢弃，不 crash |
+| 鼠标事件长度不是 13 | 丢弃，不 crash |
+| 键盘事件长度不是 11 | 丢弃，不 crash |
+| `keyCode > 255` | 丢弃并保持无副作用，不做截断 |
+
+M5 不要求 AppHost 向 Client 返回 `ERROR_RESP`。输入事件是数据面消息，坏包直接忽略即可，避免一个坏输入杀死 session。
 
 ### 5.2 AppHost 输入事件注入：PostWork 模式
 
-IoPool 收到 `INPUT_EVENT` 后，**不能**直接操作插件（插件在主线程），必须用 `PostWork` 投递：
+reader/network 线程收到 `INPUT_EVENT` 后，**不能**直接操作插件（插件在主线程），必须用 `PostWork` 投递。原因：
+
+- 插件窗口对象、业务状态、`WindowRuntime::pixels` 都按主线程 UI 模型使用。
+- M4 的 `Show()` / `Damage()` / `DoDraw()` 均同步发生在插件主线程。
+- 如果 reader 线程直接调用 `handler.Process(UI_MESSAGE_MOUSE/KEYBOARD)`，会和主线程 `DoDraw()` / `Damage()` 产生数据竞争。
+
+M5 的安全路径：
 
 ```
-IoPool 线程
-  IO_TYPE_RECEIVED → MessageHandler.feed()
+reader/network 线程
+  recv() / IO_TYPE_RECEIVED
+    → MessageHandler.feed()
     INPUT_EVENT 处理器：
       1. 读取 Body[0]（eventType），判断是鼠标还是键盘
-      2a. 鼠标（0x01~0x06）：反序列化 → UiMessageMouse
-          PostWork(inject_mouse, new UiMessageMouse{...})
-      2b. 键盘（0x10~0x11）：反序列化 → UiMessageKeyboard
-          PostWork(inject_keyboard, new UiMessageKeyboard{...})
+      2. 反序列化到一个 owned payload（不能引用 Packet::body 内存）
+      3. ui_host_impl.post_mouse_input(...) / post_keyboard_input(...)
+      4. reader 线程立即返回继续收包
 
 主线程（PostWork 回调）
-  inject_mouse(pCtx):
-      auto* pMouse = static_cast<UiMessageMouse*>(pCtx);
-      ui_host_impl_.dispatch_mouse(pMouse);   // 注入插件 DoMouse()
-      delete pMouse;
-  inject_keyboard(pCtx): 同理，注入 DoKeyboard()
+  on_host_loop()
+    → drain post_queue
+    → inject_mouse / inject_keyboard
+      → ui_host_impl.dispatch_mouse/keyboard()
+        → window.handler.Process(window.handler_ctx, UI_MESSAGE_MOUSE/KEYBOARD, &msg)
+          → GKC::_WindowImpl<T>::Process()
+            → plugin DemoWindow::DoMouse/DoKeyboard()
 ```
 
-### 5.3 需要实现/修改的文件
+### 5.2.1 生命周期与内存所有权
+
+PostWork 投递的数据不能悬空，因为 `PostWork(work, data)` 不是立即执行 `work`，而是把 `WorkProc + void* data` 放进主线程队列，等 `on_host_loop()` 后续 drain 时再执行。因此 reader/network 线程不能把栈对象地址、`Packet::body.data()` 指针或临时解析 buffer 直接传给 `PostWork`。
+
+M5 统一采用 `UiHostImpl` 内部 owns-data queue：AppHost 解析出 `UiMessageMouse` / `UiMessageKeyboard` 后，调用 `UiHostImpl::post_mouse_input()` / `post_keyboard_input()`。这些 API 立即把事件值复制进 `UiHostImpl::State` 持有的队列，再投递一个固定的 `WorkProc` 到主线程。`apphost.cpp` 不直接 `new/delete` 投递 payload。
+
+建议结构：
+
+```cpp
+struct InputEvent {
+    enum class Kind { Mouse, Keyboard } kind;
+    GKC::UiMessageMouse mouse{};
+    GKC::UiMessageKeyboard keyboard{};
+};
+
+struct State {
+    std::mutex mtx;
+    std::queue<InputEvent> input_queue;
+    bool input_work_pending = false;
+    // existing window/runtime fields...
+};
+```
+
+键盘事件示例：
+
+```cpp
+// reader/network thread, inside AppHost INPUT_EVENT handler
+void AppHost::handle_keyboard_input(uint16_t key_code, bool down) {
+    if (key_code > 255)
+        return;
+
+    GKC::UiMessageKeyboard kb{};
+    kb.btDown = down ? 1 : 0;
+    kb.btKey = static_cast<GKC::byte>(key_code);
+    kb.btState = 0;
+    kb.btValue = 0;
+    kb.chFull = 0;
+
+    ui_host_.post_keyboard_input(kb);
+}
+```
+
+`UiHostImpl` 内部复制事件并投递 work：
+
+```cpp
+void UiHostImpl::post_keyboard_input(const GKC::UiMessageKeyboard& kb) {
+    bool should_post = false;
+    {
+        std::lock_guard<std::mutex> lock(state_.mtx);
+        InputEvent ev{};
+        ev.kind = InputEvent::Kind::Keyboard;
+        ev.keyboard = kb;  // value copy; caller's stack object may disappear.
+        state_.input_queue.push(ev);
+        if (!state_.input_work_pending) {
+            state_.input_work_pending = true;
+            should_post = true;
+        }
+    }
+
+    if (should_post)
+        post_work(GKC::WorkProc{&UiHostImpl::drain_input_work}, this);
+}
+
+static void UiHostImpl::drain_input_work(void* p) noexcept {
+    static_cast<UiHostImpl*>(p)->drain_input_queue_on_main_thread();
+}
+```
+
+主线程执行 `WorkProc` 时 drain 队列：
+
+```cpp
+void UiHostImpl::drain_input_queue_on_main_thread() {
+    std::queue<InputEvent> local;
+    {
+        std::lock_guard<std::mutex> lock(state_.mtx);
+        std::swap(local, state_.input_queue);
+        state_.input_work_pending = false;
+    }
+
+    while (!local.empty()) {
+        InputEvent ev = local.front();
+        local.pop();
+        if (ev.kind == InputEvent::Kind::Keyboard)
+            dispatch_keyboard(ev.keyboard);
+        else
+            dispatch_mouse(ev.mouse);
+    }
+}
+```
+
+完整调用链：
+
+```
+reader/network thread
+  -> recv INPUT_EVENT(KEY_DOWN, KB_F1)
+  -> parse body into UiMessageKeyboard kb
+  -> ui_host_.post_keyboard_input(kb)
+      -> copy kb into UiHostImpl::State::input_queue
+      -> PostWork(drain_input_work, this)
+  -> reader thread returns
+
+plugin main thread
+  -> on_host_loop() drains PostWork queue
+  -> drain_input_work(this)
+  -> drain_input_queue_on_main_thread()
+  -> dispatch_keyboard(kb)
+  -> UiMessageHandler.Process(..., UI_MESSAGE_KEYBOARD, &kb)
+  -> DemoWindow::DoKeyboard(&kb)
+  -> DemoWindow updates state and calls Damage(full_rect)
+  -> fake host dispatches UI_MESSAGE_DRAW
+  -> DemoWindow::DoDraw(pDraw)
+  -> AppHost captures pDraw->rcPaint and sends PIXEL_DATA
+```
+
+`input_work_pending` 用来避免每个输入事件都投递一个新的 work。若多个输入事件在主线程 drain 前连续到达，它们会共享一个 pending `WorkProc`，主线程一次 drain 完当前队列。M5 也可以先不做这个合并优化，但不能牺牲事件所有权：事件内容必须由 `UiHostImpl` 持有到主线程消费完。
+
+### 5.2.2 UiHostImpl 事件注入 API
+
+`ui_host_impl` 需要新增公开方法：
+
+```cpp
+void dispatch_mouse(const GKC::UiMessageMouse& msg);
+void dispatch_keyboard(const GKC::UiMessageKeyboard& msg);
+```
+
+行为：
+
+```
+dispatch_mouse(msg):
+  if no window / destroyed / no handler:
+      return
+  window.handler.Process(
+      window.handler_ctx,
+      UI_MESSAGE_MOUSE,
+      reinterpret_cast<uintptr>(&msg))
+```
+
+`dispatch_keyboard` 同理，使用 `UI_MESSAGE_KEYBOARD`。
+
+注意点：
+
+- 这两个函数必须只在主线程/PostWork callback 中调用。
+- 如果插件 `DoMouse()` / `DoKeyboard()` 内调用 `Damage()`，会同步触发 `DoDraw()` 和 `PIXEL_DATA`，因此 `on_host_loop()` 执行 work 时必须不持有 `State::mtx`。M4 当前已经在执行 work 前 `unlock()`，这是正确基础。
+- 如果窗口尚未创建或 handler 尚未注册，输入事件应被静默丢弃，不 crash。
+
+### 5.3 demo_app 行为设计
+
+M5 的 demo 插件不再只是启动时发两帧；它需要把输入转成可观察的像素变化。建议保持窗口仍为 `32 x 16`，继续使用固定小矩形，便于测试。
+
+当前 M4 demo 行为：
+
+```
+Show(true):
+  full frame = blue background + red small rect
+
+Damage(small):
+  dirty rect = green small rect
+```
+
+M5 建议扩展为一个明确状态机：
+
+```
+state:
+  background_color
+  small_rect_color
+  mouse_click_count
+  keyboard_toggle
+
+DoMouse(pMouse):
+  if pMouse->uEvent == MOUSE_EVENT_DOWN
+     && pMouse->btButton == MOUSE_BUTTON_LEFT
+     && point inside small rect:
+        small_rect_color = next color
+        Damage(small_rect)
+
+DoKeyboard(pKb):
+  if pKb->btDown == 1 && pKb->btKey == KB_F1:
+        background_color = toggled color
+        Damage(full window)
+```
+
+测试应尽量选容易断言的颜色：
+
+| 触发 | 建议变化 | 断言 |
+|------|----------|------|
+| 左键点击小矩形 | small rect 从 green 变 yellow 或 red/green toggle | 下一包 `PIXEL_DATA` rect == small rect，像素全为新颜色 |
+| `KB_F1` key down | 背景色从 blue 变 cyan/white | 下一包 `PIXEL_DATA` rect == full window 或背景区域颜色变化 |
+
+`NoInputNoPixelData` 测试需要先 drain 掉 M4 启动时的固定两帧，然后进入短时间 recv timeout；期间 demo_app 不应自行定时重绘。
+
+### 5.4 需要实现/修改的文件
 
 | 文件 | 内容 |
 |------|------|
-| `src/protocol/protocol.h/.cpp`（确认） | INPUT_EVENT Body 的鼠标/键盘子格式序列化/反序列化 |
-| `src/apphost/ui_host_impl.h/.cpp`（更新） | 新增 `dispatch_mouse()` / `dispatch_keyboard()`：构造 ui_message_* 并调用插件的窗口消息处理器 |
-| `src/apphost/apphost.h/.cpp`（更新） | MessageHandler 注册 INPUT_EVENT 处理器；内部按 eventType 分流；PostWork 注入主线程 |
-| `plugins/demo_app/demo_app.cpp`（更新） | DoMouse：鼠标点击改变背景色；DoKeyboard：Space 键切换颜色 |
-| `src/apphost/m5_input_test.cpp` | 集成测试：经 Gateway 发送 INPUT_EVENT（鼠标），验证 PIXEL_DATA 像素变化 |
+| `src/common/input_event.h`（必要时配套 `.cpp`） | 定义 `InputEventType`、鼠标/键盘 Body pack/parse helper；使用 `src/common/byte_order.h` 的 `BE16/BE32/BE64` 读写多字节字段 |
+| `src/apphost/ui_host_impl.h/.cpp` | 新增 `dispatch_mouse()` / `dispatch_keyboard()`；必要时新增 `post_work()` wrapper，避免 `apphost.cpp` 直接碰底层 `IUiHost` table |
+| `src/apphost/apphost.h/.cpp` | 把 M4 的 INPUT_EVENT stub 改成 parser + PostWork；处理无效 Body；保证 reader 线程不直接调用插件 handler |
+| `plugins/demo_app/demo_app.cpp` | 新增 `DoMouse()` / `DoKeyboard()`；输入改变颜色状态并调用 `Damage()` |
+| `src/apphost/m5_input_test.cpp` | AppHost 局部集成测试：fake Gateway + apphost 子进程；发送 `INPUT_EVENT`；验证后续 `PIXEL_DATA` |
+| `src/apphost/BUILD` | 新增 `m5_input_test` 目标；按需要加入新的 protocol/common helper deps |
+| `src/gateway/gateway_m5_input_test.cpp` | Gateway 联立集成测试：真实 Gateway + 自动拉起 AppHost + fake Client；验证 `INPUT_EVENT` 经 M3 Gateway 路由后仍能驱动 demo_app 出帧 |
+| `src/gateway/BUILD` | 新增 `gateway_m5_input_test` 目标；复用 `gateway_m4_plugin_test` 的 fake Client / runfile / packet helper 形态 |
+| `docs/design/M4.md` 或新增 `docs/design/M5.md` | M5 完成后更新实际输入链路和 demo 行为 |
 
-### 5.4 测试要求
+### 5.5 AppHost 集成测试设计
+
+M5 测试建议分两层。第一层是 AppHost 局部集成测试，仍采用 M4 的 fake Gateway 模型，不需要真实 Client GUI：
+
+```
+apphost m5_input_test
+  ├── listen(fake Gateway)
+  ├── fork/exec apphost_bin --plugin=libdemo_app.so
+  ├── accept AppHost connection
+  ├── recv APPHOST_READY
+  ├── drain startup PIXEL_DATA frames from demo_app
+  ├── send INPUT_EVENT
+  ├── recv new PIXEL_DATA caused by input
+  └── send CLOSE_SESSION, wait child exit 0
+```
+
+这层测试的价值是隔离 AppHost：如果失败，问题基本集中在 `INPUT_EVENT` parser、`PostWork`、`ui_host_impl.dispatch_*` 或 demo 插件逻辑，不会被 Gateway 进程管理和 Session 路由干扰。
+
+第二层建议新增 Gateway 联立集成测试。它不需要真实 GKC Client，只需要 fake Client socket，但使用真实 Gateway 和真实 AppHost：
+
+```
+gateway_m5_input_test
+  ├── start real Gateway(auto_spawn_apphost=true, allowlist demo_app)
+  ├── fake Client connect Gateway public_port
+  ├── fake Client send SPAWN_APP("demo_app")
+  ├── Gateway fork/exec apphost_bin and pass demo_app plugin path
+  ├── AppHost connect Gateway internal port and send APPHOST_READY
+  ├── fake Client recv SESSION_ACK and drain startup PIXEL_DATA frames
+  ├── fake Client send INPUT_EVENT(session_id, LEFT_DOWN / KEY_DOWN)
+  ├── Gateway route original INPUT_EVENT Body to AppHost
+  ├── AppHost injects input through PostWork and sends new PIXEL_DATA
+  └── fake Client recv input-caused PIXEL_DATA, then send CLOSE_SESSION
+```
+
+从可行性看，这个测试是合理的：`src/gateway/gateway_m4_plugin_test.cpp` 已经验证了“真实 Gateway + 自动拉起真实 AppHost + fake Client 接收 demo_app 像素”的链路，M5 只是在该形态上增加 fake Client 发送 `INPUT_EVENT` 并断言后续新帧。它覆盖 fake Gateway 测不到的内容：`SPAWN_APP -> SESSION_ACK` 后的真实 SessionID、Gateway public/internal 两侧连接绑定、Client→Gateway→AppHost 的原始 Body 转发，以及 AppHost→Gateway→Client 的输入响应帧回传。
+
+但它不应替代 `src/apphost/m5_input_test.cpp`。Gateway 联立测试更接近端到端，失败面更大，适合作为 M5 的第二道验收；AppHost 局部测试仍是定位输入注入问题的主测试。
+
+推荐 helper：
+
+| Helper | 作用 |
+|--------|------|
+| `make_mouse_event(session_id, eventType, x, y, timestamp)` | 构造 `CmdType::INPUT_EVENT` packet |
+| `make_keyboard_event(session_id, eventType, keyCode, timestamp)` | 构造 keyboard packet |
+| `recv_until_pixel_after_seq(min_seq)` | 跳过旧帧，只取输入之后的新帧 |
+| `expect_rect_color(pkt, rect, color)` | 验证 dirty rect 坐标和像素颜色 |
+| `drain_startup_frames()` | 消费 M4 demo 启动时 `Show(true)` / initial `Damage()` 两包 |
+| `spawn_demo_session_via_gateway()` | Gateway 联立测试 helper：fake Client 发 `SPAWN_APP("demo_app")`，等待 `SESSION_ACK` 并返回真实 `session_id` |
+
+### 5.6 测试要求
 
 | 测试用例 | 期望结果 |
 |----------|----------|
-| `MouseClickChangesPixel` | TestClient 发 MOUSE_EVENT(DOWN, x=100, y=100)，收到 PIXEL_DATA，对应区域颜色变化 |
-| `KeyboardEventRouted` | 发 KEYBOARD_EVENT(KB_Space)，插件响应，像素变化 |
-| `NoInputNoPixelData` | 不发输入，AppHost 不发 PIXEL_DATA（静止不重传） |
-| `PostWorkThreadSafety` | 快速连续发 100 个 MOUSE_EVENT，全部被正确处理，无 crash 无数据竞争 |
+| `MouseClickChangesPixel` | fake Gateway 发 `INPUT_EVENT(LEFT_DOWN, x,y)` 到 AppHost；插件 `DoMouse()` 被主线程调用；收到新的 `PIXEL_DATA`，rect 和颜色符合 mouse 状态变化 |
+| `KeyboardEventRouted` | fake Gateway 发 `INPUT_EVENT(KEY_DOWN, KB_F1)`；插件 `DoKeyboard()` 响应；收到新的 `PIXEL_DATA`，颜色状态变化 |
+| `NoInputNoPixelData` | drain 启动帧后，不发送输入；短 timeout 内不应收到额外 `PIXEL_DATA` |
+| `InvalidInputIgnored` | 发送空 Body、未知 eventType、错误长度；AppHost 不 crash、不退出、不产生输入响应帧 |
+| `PostWorkThreadSafety` | 快速连续发 100 个 `LEFT_DOWN` 或 `MOVE` 事件；AppHost 无 crash/deadlock；最终仍能响应 `CLOSE_SESSION` 并 exit 0 |
+| `GatewayM5InputRoute` | fake Client 经真实 Gateway 启动 demo_app，发送 `INPUT_EVENT(KEY_DOWN, KB_F1)` 或 `LEFT_DOWN`；Gateway 不解析 Body 但正确转发，fake Client 收到输入触发的新 `PIXEL_DATA` |
 
-**通过标准**：`bazel test //src/apphost:m5_input_test` 全部 PASSED。
+可选但有价值：
+
+| 测试用例 | 期望结果 |
+|----------|----------|
+| `InputBeforeWindowReadyIgnored` | 在插件注册 handler 前到达的输入不会 crash（测试实现可能较难稳定，可作为单元测试覆盖） |
+| `FrameSeqIncreasesAfterInput` | 输入产生的新 `PIXEL_DATA.frameSeq` 大于启动帧 |
+| `MouseOutsideTargetNoFrame` | 点击 demo_app 非目标区域不触发 `Damage()`，不产生新帧 |
+
+### 5.7 验收标准
+
+**功能通过标准**：
+
+```
+bazel test //src/apphost:m5_input_test \
+           //src/gateway:gateway_m5_input_test
+```
+
+全部 PASSED。
+
+**工程标准**：
+
+- AppHost reader/network 线程不直接调用 `window.handler.Process()`。
+- 所有插件 `DoMouse()` / `DoKeyboard()` 调用都发生在 `on_host_loop()` drain PostWork 的主线程路径。
+- `PostWork` payload 生命周期明确，没有栈指针跨线程、没有泄漏明显路径。
+- 无效 `INPUT_EVENT` 不 crash、不关闭 session。
+- 输入触发的 `Damage()` 能复用 M4 `dispatch_draw_and_send()` 路径，不新增第二套像素发送逻辑。
+- Gateway 不需要改业务逻辑；它继续按 SessionID 原样转发 `INPUT_EVENT`。
+
+### 5.8 M5 不做的事情
+
+| 不做 | 原因 |
+|------|------|
+| 真实 Windows/Linux GUI Client | M6 范围；M5 用 fake Gateway 或 fake Client 构造 `INPUT_EVENT`；Gateway 联立测试使用真实 Gateway，但 Client 仍是测试 socket |
+| 坐标缩放 / DPI 映射 | M6 Client viewer 才知道窗口显示尺寸；M5 坐标直传 |
+| 鼠标滚轮 delta 完整语义 | 当前协议没有 delta 字段；M5 测试不依赖 |
+| 多窗口输入路由 | M4/M5 只支持单 toplevel |
+| 输入 ACK / FRAME_ACK | 当前协议无此要求，后续再评估 |
+| Gateway 解析输入 Body | Gateway 是路由层，仍不解析业务 payload |
+
+**通过标准**：M5 AppHost 局部测试、Gateway 联立测试全部 PASSED，并且 M4/M3 Gateway 回归测试仍通过：
+
+```
+bazel test //src/apphost:m5_input_test \
+           //src/gateway:gateway_m5_input_test \
+           //src/apphost:m4_plugin_test \
+           //src/apphost:apphost_lifecycle_test \
+           //src/apphost:pixel_capture_test \
+           //src/gateway:gateway_test \
+           //src/gateway:gateway_lifecycle_test \
+           //src/gateway:gateway_m4_plugin_test
+```
 
 ---
 
@@ -1361,7 +1764,7 @@ DoKeyboard(pKb)
 | 测试类型 | 测试用例 | 期望结果 |
 |----------|----------|----------|
 | 自动化集成 | `m6_client_test` | PIXEL_DATA 正确写入 PixelRenderer，FRAME_ACK 正确发送 |
-| 手动端到端 | Gateway + AppHost(demo_app) + Client(client_viewer) | 窗口显示蓝色背景，鼠标点击颜色切换，键盘 Space 切换颜色，稳定运行 60 秒无 crash |
+| 手动端到端 | Gateway + AppHost(demo_app) + Client(client_viewer) | 窗口显示蓝色背景，鼠标点击颜色切换，键盘 `KB_F1` 切换颜色，稳定运行 60 秒无 crash |
 
 **通过标准**：自动化测试 PASSED + 手动 60 秒稳定运行。
 
@@ -1502,7 +1905,8 @@ Client UI                    -> 根据 session_id 分发到不同窗口/标签�
 - [ ] fake host 的 `Quit` 线程安全，可由 IoPool 线程在收到 `CLOSE_SESSION` 时调用，唤醒主线程 `Loop`
 
 ### M5 完成标准
-- [ ] `bazel test //src/apphost:m5_input_test` — 4 个测试用例全部 PASSED
+- [ ] `bazel test //src/apphost:m5_input_test` — AppHost 局部输入测试全部 PASSED
+- [ ] `bazel test //src/gateway:gateway_m5_input_test` — 真实 Gateway + 真实 AppHost + fake Client 联立输入测试 PASSED
 - [ ] MOUSE_EVENT / KEYBOARD_EVENT 经 PostWork 安全注入插件，无数据竞争
 
 ### M6 完成标准

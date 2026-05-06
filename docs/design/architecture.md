@@ -192,7 +192,7 @@ ProtocolDesign/
 │
 ├── plugins/                   # 业务插件（独立共享库，可热替换）
 │   ├── demo_app/              # 服务端应用插件（AppHost 加载）
-│   │   ├── demo_app.cpp       # ToplevelImpl：DoDraw 画色块，DoMouse 点击换色，DoKeyboard Space 切色
+│   │   ├── demo_app.cpp       # ToplevelImpl：DoDraw 画色块，DoMouse 点击换色，DoKeyboard KB_F1 切色
 │   │   └── BUILD              # 构建为 libdemo_app.so
 │   └── client_viewer/         # 客户端查看器插件（Client 加载）
 │       ├── client_viewer.cpp  # ToplevelImpl：DoDraw 贴 PixelRenderer 缓冲，DoMouse/DoKeyboard 打包发送

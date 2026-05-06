@@ -4,7 +4,6 @@ cc_library(
     hdrs = ["protocol.h"],
     deps = ["//src/common:byte_order"],
     visibility = ["//visibility:public"],
-    copts = ["-std=c++17"],
 )
 
 cc_library(
@@ -13,7 +12,6 @@ cc_library(
     hdrs = ["message_parser.h"],
     deps = [":protocol"],
     visibility = ["//visibility:public"],
-    copts = ["-std=c++17"],
 )
 
 cc_test(
@@ -24,7 +22,6 @@ cc_test(
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],
-    copts = ["-std=c++17"],
 )
 
 cc_test(
@@ -35,5 +32,4 @@ cc_test(
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],
-    copts = ["-std=c++17"],
 )

@@ -29,3 +29,5 @@
 *.tmp
 *.swp
 *~
+
+NUL.obj

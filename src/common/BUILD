@@ -38,3 +38,29 @@ cc_test(
     ],
     copts = ["-std=c++17"],
 )
+
+# INPUT_EVENT body pack/parse helper (M5).  Exposes GKC::UiMessage* in its
+# header, so the public deps include //third_party:GkcSys.
+cc_library(
+    name = "input_event",
+    srcs = ["input_event.cpp"],
+    hdrs = ["input_event.h"],
+    deps = [
+        ":byte_order",
+        "//third_party:GkcSys",
+    ],
+    copts = ["-std=c++17"],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "input_event_test",
+    srcs = ["input_event_test.cc"],
+    deps = [
+        ":input_event",
+        "//third_party:GkcSys",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+    copts = ["-std=c++17"],
+)

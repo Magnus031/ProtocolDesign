@@ -60,6 +60,13 @@ alias(
 
 # Windows: use pre-built library from GKC_BUILD
 cc_import(
+    name = "GkcSys_windows_import",
+    shared_library = "GKC_BUILD/release/bin/Release/GkcSys.dll",
+    interface_library = "GKC_BUILD/release/bin/Release/GkcSys.lib",
+    visibility = ["//visibility:private"],
+)
+
+cc_library(
     name = "GkcSys_windows",
     hdrs = glob([
         "GKC/public/include/**/*.h",
@@ -69,8 +76,16 @@ cc_import(
         "GKC/public/include",
         "GKC/RT/GkcSys/public",
     ],
-    shared_library = "GKC_BUILD/release/bin/Release/GkcSys.dll",
-    interface_library = "GKC_BUILD/release/bin/Release/GkcSys.lib",
+    defines = [
+        "WIN32",
+        "_WINDOWS",
+        "_UNICODE",
+        "UNICODE",
+        "NOMINMAX",
+        "_WIN32_WINNT=0x0A00",
+        "NTDDI_VERSION=0x0A00000A",
+    ],
+    deps = [":GkcSys_windows_import"],
     visibility = ["//visibility:public"],
 )
 
@@ -110,5 +125,38 @@ cc_library(
         "GKC/public/include/**/*.cpp",
     ]),
     includes = ["GKC/public/include"],
+    defines = select({
+        "@platforms//os:windows": [
+            "WIN32",
+            "_WINDOWS",
+            "_UNICODE",
+            "UNICODE",
+            "NOMINMAX",
+            "_WIN32_WINNT=0x0A00",
+            "NTDDI_VERSION=0x0A00000A",
+        ],
+        "//conditions:default": [],
+    }),
+    visibility = ["//visibility:public"],
+)
+
+# gkc_uihost_runtime exposes GKC's real GUI host implementation to host-side
+# executables such as src/client:client.  The executable includes SysDef.cpp and
+# GkcUIMain.cpp textually, matching third_party/GKC/util/gui/uihost/src/Main.cpp.
+cc_library(
+    name = "gkc_uihost_runtime",
+    hdrs = glob([
+        "GKC/util/gui/uihost/include/**/*.h",
+        "GKC/util/private/include/ui/**/*.h",
+    ]),
+    textual_hdrs = glob([
+        "GKC/util/gui/uihost/include/**/*.cpp",
+        "GKC/util/private/include/ui/**/*.cpp",
+    ]),
+    includes = [
+        "GKC/util/gui/uihost/include",
+        "GKC/util/private/include/ui",
+    ],
+    deps = [":GkcSys"],
     visibility = ["//visibility:public"],
 )

@@ -80,3 +80,23 @@ cc_test(
     ],
     copts = ["-std=c++17"],
 )
+
+# M5: real Gateway routes INPUT_EVENT body unchanged; AppHost emits new
+# PIXEL_DATA driven by demo_app DoMouse/DoKeyboard.
+cc_test(
+    name = "gateway_m5_input_test",
+    srcs = ["gateway_m5_input_test.cpp"],
+    data = [
+        "//plugins/demo_app:libdemo_app.so",
+        "//src/apphost:apphost_bin",
+    ],
+    deps = [
+        ":gateway",
+        "//src/common:input_event",
+        "//src/protocol:message_parser",
+        "//src/protocol:protocol",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+    copts = ["-std=c++17"],
+)

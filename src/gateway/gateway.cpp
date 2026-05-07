@@ -23,6 +23,33 @@
 
 namespace {
 
+// IoPool's send buffer is fixed at 4000 bytes (BUFFER_SIZE in
+// third_party/GKC/RT/GkcSys/include/base/system/Linux/sys_io.h:24).  BeginInput
+// blindly returns that buffer for any uLen the caller supplies — the bounds
+// assert is compiled out in release builds — so passing a uLen > 4000 stomps
+// the heap during the subsequent memcpy and crashes once the next allocation
+// touches the corrupted region.  All packets larger than this must therefore
+// be split into ≤ kIoPoolMaxChunk pieces before being handed to BeginInput.
+// TCP delivers the wire bytes as a stream, so chunking is invisible to the
+// peer's MessageParser.
+constexpr size_t kIoPoolMaxChunk = 4000;
+
+void push_chunked(std::queue<std::vector<uint8_t>>& q,
+                  std::vector<uint8_t> data) {
+    if (data.empty()) return;
+    if (data.size() <= kIoPoolMaxChunk) {
+        q.push(std::move(data));
+        return;
+    }
+    size_t off = 0;
+    while (off < data.size()) {
+        const size_t take = std::min(kIoPoolMaxChunk, data.size() - off);
+        q.emplace(data.begin() + static_cast<std::ptrdiff_t>(off),
+                  data.begin() + static_cast<std::ptrdiff_t>(off + take));
+        off += take;
+    }
+}
+
 std::vector<uint8_t> serialize_packet(const Packet& pkt) {
     std::vector<uint8_t> out(HEADER_SIZE + pkt.body.size());
     Header hdr = pkt.header;
@@ -365,21 +392,32 @@ struct Gateway::Impl {
             atomic_compare_exchange((int&)client_lock_, 1, 0);
             return;
         }
-        // If client->send_queue_ is not empty, return 
-        if (!conn->send_queue_.empty()) {
-            conn->send_queue_.push(std::move(data));
+
+        // Split the packet into IoPool-sized chunks before queueing.  A
+        // single PIXEL_DATA frame for a 160x200 canvas is ~128 KB; without
+        // chunking, BeginInput corrupts the 4 KB send buffer and crashes.
+        const bool was_idle = conn->send_queue_.empty();
+        push_chunked(conn->send_queue_, std::move(data));
+        if (!was_idle || conn->send_queue_.empty()) {
+            // Earlier chunks are still in flight; the existing drain path
+            // (IO_TYPE_SENT → schedule_client_drain) will pick up the new
+            // tail when iSend clears.
             atomic_compare_exchange((int&)client_lock_, 1, 0);
             return;
         }
 
+        // Eager fast path: queue was empty, so iSend is also clear.  Hand
+        // the head chunk to BeginInput; if BeginInput refuses (busy or pool
+        // cancelled) we leave the chunk in the queue and rely on drain.
+        const auto& chunk = conn->send_queue_.front();
         bool cancelled = false;
         byte* raw = pool_.GetFunc()->BeginInput(
-            pool_.GetContext(), conn->id_, static_cast<uint>(data.size()), cancelled);
+            pool_.GetContext(), conn->id_,
+            static_cast<uint>(chunk.size()), cancelled);
         if (raw && !cancelled) {
-            std::memcpy(raw, data.data(), data.size());
+            std::memcpy(raw, chunk.data(), chunk.size());
+            conn->send_queue_.pop();
             pool_.GetFunc()->EndInput(pool_.GetContext(), conn->id_);
-        } else if (!cancelled) {
-            conn->send_queue_.push(std::move(data));
         }
         atomic_compare_exchange((int&)client_lock_, 1, 0);
     }
@@ -390,20 +428,23 @@ struct Gateway::Impl {
             atomic_compare_exchange((int&)apphost_lock_, 1, 0);
             return;
         }
-        if (!conn->send_queue_.empty()) {
-            conn->send_queue_.push(std::move(data));
+
+        const bool was_idle = conn->send_queue_.empty();
+        push_chunked(conn->send_queue_, std::move(data));
+        if (!was_idle || conn->send_queue_.empty()) {
             atomic_compare_exchange((int&)apphost_lock_, 1, 0);
             return;
         }
 
+        const auto& chunk = conn->send_queue_.front();
         bool cancelled = false;
         byte* raw = pool_.GetFunc()->BeginInput(
-            pool_.GetContext(), conn->id_, static_cast<uint>(data.size()), cancelled);
+            pool_.GetContext(), conn->id_,
+            static_cast<uint>(chunk.size()), cancelled);
         if (raw && !cancelled) {
-            std::memcpy(raw, data.data(), data.size());
+            std::memcpy(raw, chunk.data(), chunk.size());
+            conn->send_queue_.pop();
             pool_.GetFunc()->EndInput(pool_.GetContext(), conn->id_);
-        } else if (!cancelled) {
-            conn->send_queue_.push(std::move(data));
         }
         atomic_compare_exchange((int&)apphost_lock_, 1, 0);
     }

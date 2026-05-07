@@ -89,3 +89,27 @@ TEST(PixelRendererTest, ParsesPixelDataBody) {
               renderer.apply_pixel_data_body(body.data(), body.size()));
     EXPECT_EQ(7u, renderer.last_frame_seq());
 }
+
+TEST(PixelRendererTest, BlitsScaledFrame) {
+    PixelRenderer renderer(2, 2);
+    GKC::UiRect rect;
+    rect.Set(0, 0, 2, 2);
+    const std::vector<uint8_t> argb = {
+        255, 255, 0, 0, 255, 0, 255, 0,
+        255, 0, 0, 255, 255, 255, 255, 0,
+    };
+
+    EXPECT_EQ(PixelRenderer::ApplyResult::OK,
+              renderer.apply_dirty_rect(1, rect, argb.data(), argb.size()));
+
+    std::vector<color_quad> out(16, COLOR_QUAD_BLACK);
+    GKC::UiRect full;
+    full.Set(0, 0, 4, 4);
+    renderer.blit_scaled_to_fit(out.data(), 4, 4, full);
+
+    EXPECT_EQ(COLOR_QUAD_RED, out[0]);
+    EXPECT_EQ(COLOR_QUAD_RED, out[5]);
+    EXPECT_EQ(COLOR_QUAD_GREEN, out[2]);
+    EXPECT_EQ(COLOR_QUAD_BLUE, out[8]);
+    EXPECT_EQ(COLOR_QUAD_YELLOW, out[15]);
+}

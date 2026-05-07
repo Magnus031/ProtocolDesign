@@ -117,6 +117,25 @@ void PixelRenderer::blit(color_quad* dst, int dst_width, int dst_height,
     }
 }
 
+void PixelRenderer::blit_scaled_to_fit(color_quad* dst, int dst_width,
+                                       int dst_height,
+                                       const GKC::UiRect& paint) const {
+    if (dst == nullptr || dst_width <= 0 || dst_height <= 0) return;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    GKC::UiRect clipped;
+    if (!clip_rect(paint, dst_width, dst_height, clipped)) return;
+
+    for (int y = clipped.T(); y < clipped.B(); ++y) {
+        const int src_y = std::min(height_ - 1, (y * height_) / dst_height);
+        color_quad* row = dst + static_cast<size_t>(y) * dst_width;
+        for (int x = clipped.L(); x < clipped.R(); ++x) {
+            const int src_x = std::min(width_ - 1, (x * width_) / dst_width);
+            row[x] = pixels_[static_cast<size_t>(src_y) * width_ + src_x];
+        }
+    }
+}
+
 void PixelRenderer::paint_demo(bool yellow_rect, bool cyan_background) {
     std::lock_guard<std::mutex> lock(mutex_);
     const color_quad bg = cyan_background ? COLOR_QUAD_CYAN : COLOR_QUAD_BLUE;

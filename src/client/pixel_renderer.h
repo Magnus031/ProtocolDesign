@@ -37,6 +37,11 @@ public:
     void blit(color_quad* dst, int dst_width, int dst_height,
               const GKC::UiRect& paint) const;
 
+    // Copies the current frame into a larger or smaller destination while
+    // preserving nearest-neighbour pixel edges.
+    void blit_scaled_to_fit(color_quad* dst, int dst_width, int dst_height,
+                            const GKC::UiRect& paint) const;
+
     // Paints the local M6a demonstration frame used before M6b networking is
     // connected.
     void paint_demo(bool yellow_rect, bool cyan_background);

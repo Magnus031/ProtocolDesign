@@ -97,9 +97,10 @@ constexpr uint8_t kDigitGlyphs[10][kGlyphH] = {
     {0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100},
 };
 
-// 5x7 bitmaps for the letters that appear on the RESET button.  Kept as a
-// minimal set (R, E, S, T) — the spec explicitly allows a "simple equivalent
-// state prompt" elsewhere, so we do not need a full alphabet.
+// 5x7 bitmaps for the letters used by static labels in the UI: "RESET" on
+// the button and "GAME OVER!" in the game-over indicator.  Kept as a small
+// hand-rolled set instead of pulling in a font system; new labels need new
+// glyphs added here.
 constexpr uint8_t kLetterR[kGlyphH] = {
     0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
 };
@@ -111,6 +112,29 @@ constexpr uint8_t kLetterS[kGlyphH] = {
 };
 constexpr uint8_t kLetterT[kGlyphH] = {
     0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+};
+constexpr uint8_t kLetterG[kGlyphH] = {
+    0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110,
+};
+constexpr uint8_t kLetterA[kGlyphH] = {
+    0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+};
+constexpr uint8_t kLetterM[kGlyphH] = {
+    0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
+};
+constexpr uint8_t kLetterO[kGlyphH] = {
+    0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+};
+constexpr uint8_t kLetterV[kGlyphH] = {
+    0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+};
+constexpr uint8_t kBangGlyph[kGlyphH] = {
+    0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100,
+};
+// All-zero glyph used to render an inter-word space.  Drawing it is a no-op
+// but it advances the cursor by one glyph width plus the usual spacing.
+constexpr uint8_t kSpaceGlyph[kGlyphH] = {
+    0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000,
 };
 
 // ── Colour palette ─────────────────────────────────────────────────────────
@@ -274,6 +298,27 @@ int draw_reset_label(color_quad* buf, int stride, int x, int y, color_quad fg) {
 
 constexpr int kResetLabelWidth = 5 * kGlyphW + 4 * kGlyphSpacing;
 
+// Draw the literal string "GAME OVER!" left-to-right starting at (x, y).
+// Returns the width consumed in pixels.  The space between "GAME" and "OVER!"
+// is rendered as a blank glyph so the inter-letter cadence stays uniform.
+int draw_game_over_label(color_quad* buf, int stride,
+                         int x, int y, color_quad fg) {
+    const uint8_t* glyphs[10] = {
+        kLetterG, kLetterA, kLetterM, kLetterE,
+        kSpaceGlyph,
+        kLetterO, kLetterV, kLetterE, kLetterR, kBangGlyph,
+    };
+    int w = 0;
+    for (int i = 0; i < 10; ++i) {
+        draw_glyph(buf, stride, x + w, y, glyphs[i], fg);
+        w += kGlyphW;
+        if (i + 1 < 10) w += kGlyphSpacing;
+    }
+    return w;
+}
+
+constexpr int kGameOverLabelWidth = 10 * kGlyphW + 9 * kGlyphSpacing;
+
 // ── Window ─────────────────────────────────────────────────────────────────
 
 class App2048Window : public GKC::ToplevelImpl<App2048Window> {
@@ -420,15 +465,18 @@ private:
         const int label_y = kResetButtonTop  + (btn_h - kGlyphH) / 2;
         draw_reset_label(buf, stride, label_x, label_y, kColorButtonText);
 
-        // Game-over indicator on the right side of the strip.  Solid red
-        // when GameOver, otherwise leaves the background visible — the
-        // indicator is intentionally small text-free per the spec
-        // ("GAME OVER 或等价的简单状态提示").
+        // Game-over indicator on the right side of the strip.  When the
+        // board reaches GameOver we render the literal text "GAME OVER!"
+        // in the accent colour, centred inside the indicator rect.  The
+        // rect itself is left transparent (background colour) so the text
+        // reads as a status message rather than a coloured banner —
+        // matches the spec line "GAME OVER 或等价的简单状态提示".
         if (board_.state() == app_2048::GameState::GameOver) {
-            fill_rect(buf, stride,
-                      kGameOverLeft, kGameOverTop,
-                      kGameOverRight, kGameOverBottom,
-                      kColorGameOver);
+            const int rect_w = kGameOverRight  - kGameOverLeft;
+            const int rect_h = kGameOverBottom - kGameOverTop;
+            const int label_x = kGameOverLeft + (rect_w - kGameOverLabelWidth) / 2;
+            const int label_y = kGameOverTop  + (rect_h - kGlyphH) / 2;
+            draw_game_over_label(buf, stride, label_x, label_y, kColorGameOver);
         }
     }
 

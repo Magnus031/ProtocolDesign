@@ -18,21 +18,20 @@
 
 namespace {
 
-constexpr int kWindowWidth = 32;
-constexpr int kWindowHeight = 16;
-constexpr int kDisplayScale = 10;
-constexpr int kDisplayWidth = kWindowWidth * kDisplayScale;
-constexpr int kDisplayHeight = kWindowHeight * kDisplayScale;
-constexpr int kSmallLeft = 8;
-constexpr int kSmallTop = 4;
-constexpr int kSmallRight = 16;
-constexpr int kSmallBottom = 12;
+// Defaults match M6a demo_app (32x16 logical canvas, 10x scale).  2048 expects
+// 160x200 logical with display-scale 4; pass via CLI per docs/design/2048.md.
+constexpr int kDefaultCanvasWidth  = 32;
+constexpr int kDefaultCanvasHeight = 16;
+constexpr int kDefaultDisplayScale = 10;
 
 struct ViewerOptions {
     std::string gateway_host = "127.0.0.1";
     uint16_t gateway_port = 19000;
     std::string app_name = "demo_app";
     bool offline = true;
+    int canvas_width  = kDefaultCanvasWidth;
+    int canvas_height = kDefaultCanvasHeight;
+    int display_scale = kDefaultDisplayScale;
 };
 
 std::string to_std_string(const GKC::ConstStringS& s) {
@@ -79,13 +78,28 @@ ViewerOptions parse_options(const GKC::ConstArray<GKC::ConstStringS>& args) {
             out.app_name = arg.substr(std::string("--app=").size());
         } else if (arg == "--offline") {
             out.offline = true;
+        } else if (starts_with(arg, "--canvas-width=")) {
+            const int v =
+                std::stoi(arg.substr(std::string("--canvas-width=").size()));
+            if (v > 0) out.canvas_width = v;
+        } else if (starts_with(arg, "--canvas-height=")) {
+            const int v =
+                std::stoi(arg.substr(std::string("--canvas-height=").size()));
+            if (v > 0) out.canvas_height = v;
+        } else if (starts_with(arg, "--display-scale=")) {
+            const int v =
+                std::stoi(arg.substr(std::string("--display-scale=").size()));
+            if (v > 0) out.display_scale = v;
         }
     }
     client_log_line("viewer: options offline=" +
                     std::to_string(out.offline ? 1 : 0) +
                     " host=" + out.gateway_host +
                     " port=" + std::to_string(out.gateway_port) +
-                    " app=" + out.app_name);
+                    " app=" + out.app_name +
+                    " canvas=" + std::to_string(out.canvas_width) + "x" +
+                    std::to_string(out.canvas_height) +
+                    " scale=" + std::to_string(out.display_scale));
     return out;
 }
 
@@ -129,14 +143,20 @@ private:
 class ViewerWindow : public GKC::ToplevelImpl<ViewerWindow> {
 public:
     ViewerWindow() {
-        renderer_.reset(kWindowWidth, kWindowHeight, COLOR_QUAD_BLUE);
-        renderer_.paint_demo(false, false);
         repaint_work_.Bind(this);
     }
 
     bool Start(const ViewerOptions& options) {
         options_ = options;
-        if (!Create(true, kDisplayWidth, kDisplayHeight)) {
+        canvas_width_  = options.canvas_width;
+        canvas_height_ = options.canvas_height;
+        display_scale_ = options.display_scale;
+        display_width_  = canvas_width_  * display_scale_;
+        display_height_ = canvas_height_ * display_scale_;
+
+        renderer_.reset(canvas_width_, canvas_height_, COLOR_QUAD_BLUE);
+
+        if (!Create(true, display_width_, display_height_)) {
             client_log_line("viewer: Create failed");
             return false;
         }
@@ -178,19 +198,13 @@ public:
 
     void DoMouse(GKC::UiMessageMouse* pMouse) noexcept {
         if (pMouse == nullptr) return;
-        const int logical_x = (pMouse->x * kWindowWidth) / kDisplayWidth;
-        const int logical_y = (pMouse->y * kWindowHeight) / kDisplayHeight;
+        const int logical_x =
+            display_width_  > 0 ? (pMouse->x * canvas_width_)  / display_width_  : 0;
+        const int logical_y =
+            display_height_ > 0 ? (pMouse->y * canvas_height_) / display_height_ : 0;
         const InputEventType type = mouse_event_type(*pMouse);
         runtime_.send_input_event(
             pack_mouse_input_event(type, logical_x, logical_y, timestamp_us()));
-
-        if (type == InputEventType::MOUSE_LEFT_DOWN &&
-            logical_x >= kSmallLeft && logical_x < kSmallRight &&
-            logical_y >= kSmallTop && logical_y < kSmallBottom) {
-            yellow_rect_ = !yellow_rect_;
-            renderer_.paint_demo(yellow_rect_, cyan_background_);
-            DamageFull();
-        }
     }
 
     void DoKeyboard(GKC::UiMessageKeyboard* pKb) noexcept {
@@ -199,12 +213,6 @@ public:
                                                 : InputEventType::KEY_UP;
         runtime_.send_input_event(
             pack_keyboard_input_event(type, pKb->btKey, timestamp_us()));
-
-        if (pKb->btDown == 1 && pKb->btKey == KB_F1) {
-            cyan_background_ = !cyan_background_;
-            renderer_.paint_demo(yellow_rect_, cyan_background_);
-            DamageFull();
-        }
     }
 
     void DoClose() noexcept {
@@ -214,7 +222,7 @@ public:
 
     void DamageFull() noexcept {
         GKC::UiRect r;
-        r.Set(0, 0, kDisplayWidth, kDisplayHeight);
+        r.Set(0, 0, display_width_, display_height_);
         Damage(r);
     }
 
@@ -223,8 +231,11 @@ private:
     PixelRenderer renderer_;
     ClientRuntime runtime_;
     RepaintWork repaint_work_;
-    bool yellow_rect_ = false;
-    bool cyan_background_ = false;
+    int canvas_width_ = kDefaultCanvasWidth;
+    int canvas_height_ = kDefaultCanvasHeight;
+    int display_scale_ = kDefaultDisplayScale;
+    int display_width_ = kDefaultCanvasWidth * kDefaultDisplayScale;
+    int display_height_ = kDefaultCanvasHeight * kDefaultDisplayScale;
     int draw_count_ = 0;
 };
 

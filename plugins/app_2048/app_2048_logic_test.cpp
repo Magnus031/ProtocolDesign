@@ -33,16 +33,19 @@ std::array<uint32_t, kCellCount> snapshot(const Board& b) {
     return out;
 }
 
-// Helper: zero out tiles that the post-move spawn might have placed in any
-// pre-existing empty cell.  We accept exactly one new 2 or 4 in cells that
-// were empty BOTH before and after the in-place compression.  The expected
-// layout passed in must be the post-compression layout WITHOUT the spawn.
+// Helper: zero out the new tile that Board::move spawns after a successful
+// compression so the caller can compare against a deterministic
+// post-compression layout.  spawn_random_tile lands in any cell that is
+// empty AFTER compression — including cells emptied by the move itself —
+// so the only safe "this must be the spawn" rule is "expected to be empty,
+// observed to be non-empty".  At most one such cell is allowed; finding
+// more means either the move logic doubled up or the expected layout is
+// wrong.
 void erase_spawn_diff(std::array<uint32_t, kCellCount>& observed,
-                      const std::array<uint32_t, kCellCount>& pre_move,
                       const std::array<uint32_t, kCellCount>& expected_after) {
     int spawn_count = 0;
     for (int i = 0; i < kCellCount; ++i) {
-        if (pre_move[i] == 0 && expected_after[i] == 0 && observed[i] != 0) {
+        if (expected_after[i] == 0 && observed[i] != 0) {
             EXPECT_TRUE(observed[i] == 2u || observed[i] == 4u)
                 << "spawned tile must be 2 or 4, got " << observed[i];
             observed[i] = 0;
@@ -79,7 +82,7 @@ TEST(BoardMove, MoveLeftNoMerge) {
         0, 0, 0, 0,
         0, 0, 0, 0,
     });
-    erase_spawn_diff(after, pre, expected);
+    erase_spawn_diff(after, expected);
     EXPECT_EQ(after, expected);
 }
 
@@ -108,7 +111,7 @@ TEST(BoardMove, MoveLeftOneMerge) {
         0, 0, 0, 0,
         0, 0, 0, 0,
     });
-    erase_spawn_diff(after, pre, expected);
+    erase_spawn_diff(after, expected);
     EXPECT_EQ(after, expected);
 }
 
@@ -138,7 +141,7 @@ TEST(BoardMove, TileCannotMergeTwiceInOneMove) {
         0, 0, 0, 0,
         0, 0, 0, 0,
     });
-    erase_spawn_diff(after, pre, expected);
+    erase_spawn_diff(after, expected);
     EXPECT_EQ(after, expected);
 }
 

@@ -569,7 +569,14 @@ struct Gateway::Impl {
                 handle_spawn_app(conn, pkt);
                 break;
             case CmdType::HEARTBEAT:
+                // Echo back to the client so its liveness check is satisfied,
+                // and forward to the apphost so its `last_apphost_seen` advances
+                // via the apphost's own HEARTBEAT echo. Without the forward, an
+                // apphost that never Damages (game-over screen, idle UI) hits
+                // apphost_timeout_ms even while the client is heart-beating.
                 enqueue_client(conn, make_packet(CmdType::HEARTBEAT, pkt.header.session_id));
+                if (conn->session_id_ != 0)
+                    forward_to_apphost(pkt);
                 break;
             case CmdType::CLOSE_SESSION:
                 close_session(pkt.header.session_id);

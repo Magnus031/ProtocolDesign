@@ -23,7 +23,10 @@ cc_test(
 cc_library(
     name = "client_runtime",
     srcs = ["client.cpp"],
-    hdrs = ["client.h"],
+    hdrs = [
+        "client.h",
+        "client_log.h",
+    ],
     deps = [
         ":pixel_renderer",
         "//src/protocol:message_parser",
@@ -56,6 +59,7 @@ cc_binary(
     name = "client",
     srcs = ["main.cpp"],
     deps = [
+        ":client_runtime",
         ":plugin_loader",
         "//third_party:GkcSys",
         "//third_party:gkc_uihost_runtime",

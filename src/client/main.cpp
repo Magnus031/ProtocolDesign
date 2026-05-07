@@ -5,6 +5,7 @@
 #include "base/GkcDef.h"
 #include "../../third_party/GKC/util/private/include/ui/UIDef.h"
 
+#include "src/client/client_log.h"
 #include "src/client/plugin_loader.h"
 
 #include "base/SysDef.h"
@@ -40,7 +41,13 @@ namespace GKC {
 class ProgramEntryPoint {
 public:
     static int UIMain(const ConstArray<ConstStringS>& args) {
-        if (!GKC::g_win_ui_host.Initialize()) return 101;
+        client_log_line("client-main: UIMain entered args=" +
+                        std::to_string(static_cast<size_t>(args.GetCount())));
+        if (!GKC::g_win_ui_host.Initialize()) {
+            client_log_line("client-main: g_win_ui_host.Initialize failed");
+            return 101;
+        }
+        client_log_line("client-main: g_win_ui_host initialized");
 
         std::vector<std::string> forwarded;
         forwarded.reserve(args.GetCount());
@@ -51,19 +58,27 @@ public:
             if (starts_with(arg, "--plugin=")) {
                 plugin_path = arg.substr(std::string("--plugin=").size());
             }
+            client_log_line("client-main: arg " + arg);
             forwarded.push_back(std::move(arg));
         }
+        client_log_line("client-main: plugin_path=" + plugin_path);
 
         ClientPluginLoader loader;
         if (!loader.open(plugin_path)) {
             std::fprintf(stderr, "client: %s\n", loader.last_error().c_str());
+            client_log_line("client-main: plugin open failed: " +
+                            loader.last_error());
             return 102;
         }
+        client_log_line("client-main: plugin opened");
 
-        return loader.run(
+        const int rc = loader.run(
             LcInterface<IUiHost>(&GKC::g_win_ui_host,
                                  RefPtr<IUiHost>(GKC::g_ui_host_interface)),
             forwarded);
+        client_log_line("client-main: plugin returned rc=" +
+                        std::to_string(rc));
+        return rc;
     }
 };
 

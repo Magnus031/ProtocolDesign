@@ -10,7 +10,10 @@ cc_binary(
     ],
     linkshared = True,
     linkopts = select({
-        "@platforms//os:windows": ["ws2_32.lib"],
+        "@platforms//os:windows": [
+            "ws2_32.lib",
+            "user32.lib",
+        ],
         "//conditions:default": [],
     }),
     copts = ["-std=c++17"],

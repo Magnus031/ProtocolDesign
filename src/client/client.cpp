@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstring>
 
+#include "src/client/client_log.h"
 #include "src/protocol/protocol.h"
 
 #if defined(_WIN32)
@@ -14,6 +15,7 @@
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <cerrno>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -21,11 +23,27 @@
 
 namespace {
 
+constexpr auto kHeartbeatInterval = std::chrono::seconds(1);
+
 void write_be32(uint8_t* p, uint32_t v) noexcept {
     p[0] = static_cast<uint8_t>((v >> 24) & 0xFF);
     p[1] = static_cast<uint8_t>((v >> 16) & 0xFF);
     p[2] = static_cast<uint8_t>((v >> 8) & 0xFF);
     p[3] = static_cast<uint8_t>(v & 0xFF);
+}
+
+const char* cmd_name(CmdType cmd) noexcept {
+    switch (cmd) {
+        case CmdType::HEARTBEAT: return "HEARTBEAT";
+        case CmdType::SPAWN_APP: return "SPAWN_APP";
+        case CmdType::SESSION_ACK: return "SESSION_ACK";
+        case CmdType::APPHOST_READY: return "APPHOST_READY";
+        case CmdType::PIXEL_DATA: return "PIXEL_DATA";
+        case CmdType::INPUT_EVENT: return "INPUT_EVENT";
+        case CmdType::CLOSE_SESSION: return "CLOSE_SESSION";
+        case CmdType::ERROR_RESP: return "ERROR_RESP";
+        default: return "UNKNOWN";
+    }
 }
 
 std::vector<uint8_t> pack_spawn_app_body(const std::string& app_name) {
@@ -50,6 +68,28 @@ bool ensure_winsock(std::string& error) {
 }
 #endif
 
+void set_recv_timeout(uintptr_t socket_value) {
+#if defined(_WIN32)
+    const DWORD timeout_ms = 250;
+    setsockopt(static_cast<SOCKET>(socket_value), SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+#else
+    timeval tv{};
+    tv.tv_sec = 0;
+    tv.tv_usec = 250000;
+    setsockopt(static_cast<int>(socket_value), SOL_SOCKET, SO_RCVTIMEO, &tv,
+               sizeof(tv));
+#endif
+}
+
+bool is_recv_timeout() noexcept {
+#if defined(_WIN32)
+    return WSAGetLastError() == WSAETIMEDOUT;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
+}
+
 }  // namespace
 
 ClientRuntime::ClientRuntime() = default;
@@ -69,7 +109,14 @@ bool ClientRuntime::start(const Options& options, PixelRenderer* renderer,
     connected_.store(false);
     set_error(std::string());
 
-    if (!options_.connect_gateway) return false;
+    client_log_line("runtime: start host=" + options_.gateway_host +
+                    " port=" + std::to_string(options_.gateway_port) +
+                    " app=" + options_.app_name);
+
+    if (!options_.connect_gateway) {
+        client_log_line("runtime: connect_gateway=false");
+        return false;
+    }
 
     thread_ = std::thread(&ClientRuntime::run, this);
     return true;
@@ -102,17 +149,35 @@ const std::string& ClientRuntime::last_error() const {
 }
 
 void ClientRuntime::run() {
-    if (!open_socket()) return;
+    if (!open_socket()) {
+        client_log_line("runtime: open_socket failed: " + last_error());
+        return;
+    }
     connected_.store(true);
+    set_recv_timeout(socket_);
+    client_log_line("runtime: connected");
 
     if (!send_spawn_app()) {
+        client_log_line("runtime: send SPAWN_APP failed: " + last_error());
         close_socket();
         connected_.store(false);
         return;
     }
+    client_log_line("runtime: sent SPAWN_APP");
 
     std::array<uint8_t, 4096> buffer{};
+    auto next_heartbeat = std::chrono::steady_clock::now() + kHeartbeatInterval;
     while (!stop_requested_.load()) {
+        const uint32_t sid = session_id_.load();
+        const auto now = std::chrono::steady_clock::now();
+        if (sid != 0 && now >= next_heartbeat) {
+            if (send_packet(CmdType::HEARTBEAT, sid, {})) {
+                client_log_line("runtime: sent HEARTBEAT session=" +
+                                std::to_string(sid));
+            }
+            next_heartbeat = now + kHeartbeatInterval;
+        }
+
 #if defined(_WIN32)
         const int n = recv(static_cast<SOCKET>(socket_),
                            reinterpret_cast<char*>(buffer.data()),
@@ -121,7 +186,11 @@ void ClientRuntime::run() {
         const int n = static_cast<int>(
             recv(socket_, buffer.data(), buffer.size(), 0));
 #endif
-        if (n <= 0) break;
+        if (n <= 0) {
+            if (is_recv_timeout()) continue;
+            break;
+        }
+        client_log_line("runtime: recv bytes=" + std::to_string(n));
 
         parser_.feed(buffer.data(), static_cast<size_t>(n));
         Packet pkt;
@@ -130,8 +199,18 @@ void ClientRuntime::run() {
         }
     }
 
+#if defined(_WIN32)
+    if (!stop_requested_.load()) {
+        client_log_line("runtime: recv ended n<=0 wsa_error=" +
+                        std::to_string(WSAGetLastError()));
+    }
+#else
+    if (!stop_requested_.load()) client_log_line("runtime: recv ended n<=0");
+#endif
+
     close_socket();
     connected_.store(false);
+    client_log_line("runtime: stopped");
 }
 
 bool ClientRuntime::open_socket() {
@@ -183,6 +262,8 @@ bool ClientRuntime::open_socket() {
 
     if (!ok) {
         set_error("connect failed for " + options_.gateway_host + ":" + port);
+        client_log_line("runtime: connect failed for " + options_.gateway_host +
+                        ":" + port);
     }
     return ok;
 }
@@ -221,27 +302,49 @@ bool ClientRuntime::send_packet(CmdType cmd, uint32_t session_id,
         }
         sent += static_cast<size_t>(n);
     }
+    client_log_line("runtime: sent packet cmd=" + std::string(cmd_name(cmd)) +
+                    " session=" + std::to_string(session_id) +
+                    " bytes=" + std::to_string(packet.size()));
     return true;
 }
 
 void ClientRuntime::handle_packet(const Packet& packet) {
+    client_log_line("runtime: packet cmd=" +
+                    std::string(cmd_name(packet.header.cmd_type)) +
+                    " session=" + std::to_string(packet.header.session_id) +
+                    " body=" + std::to_string(packet.body.size()));
     switch (packet.header.cmd_type) {
         case CmdType::SESSION_ACK:
             session_id_.store(packet.header.session_id);
+            client_log_line("runtime: SESSION_ACK session_id=" +
+                            std::to_string(packet.header.session_id));
             break;
         case CmdType::PIXEL_DATA:
-            if (renderer_ != nullptr &&
-                renderer_->apply_pixel_data_body(packet.body.data(),
-                                                 packet.body.size()) ==
-                    PixelRenderer::ApplyResult::OK &&
-                repaint_callback_) {
-                repaint_callback_();
+            if (renderer_ != nullptr) {
+                const auto result = renderer_->apply_pixel_data_body(
+                    packet.body.data(), packet.body.size());
+                client_log_line("runtime: PIXEL_DATA len=" +
+                                std::to_string(packet.body.size()) +
+                                " result=" +
+                                std::to_string(static_cast<int>(result)));
+                if (result == PixelRenderer::ApplyResult::OK &&
+                    repaint_callback_) {
+                    client_log_line("runtime: invoking repaint_callback");
+                    repaint_callback_();
+                }
             }
             break;
         case CmdType::ERROR_RESP:
             set_error("Gateway returned ERROR_RESP");
+            client_log_line("runtime: ERROR_RESP");
+            break;
+        case CmdType::CLOSE_SESSION:
+            client_log_line("runtime: CLOSE_SESSION");
             break;
         default:
+            client_log_line("runtime: ignored packet cmd_value=" +
+                            std::to_string(static_cast<int>(
+                                packet.header.cmd_type)));
             break;
     }
 }

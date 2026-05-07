@@ -1,11 +1,18 @@
 #include <chrono>
 #include <cstdio>
+#include <sstream>
 #include <string>
 #include <vector>
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 
 #include "base/GkcDef.h"
 #include "base/GkcGui.h"
 #include "src/client/client.h"
+#include "src/client/client_log.h"
 #include "src/client/pixel_renderer.h"
 #include "src/common/input_event.h"
 
@@ -13,6 +20,9 @@ namespace {
 
 constexpr int kWindowWidth = 32;
 constexpr int kWindowHeight = 16;
+constexpr int kDisplayScale = 10;
+constexpr int kDisplayWidth = kWindowWidth * kDisplayScale;
+constexpr int kDisplayHeight = kWindowHeight * kDisplayScale;
 constexpr int kSmallLeft = 8;
 constexpr int kSmallTop = 4;
 constexpr int kSmallRight = 16;
@@ -47,8 +57,15 @@ uint64_t timestamp_us() {
 
 ViewerOptions parse_options(const GKC::ConstArray<GKC::ConstStringS>& args) {
     ViewerOptions out;
+    std::vector<std::string> tokens;
     for (uintptr i = 0; i < args.GetCount(); ++i) {
-        const std::string arg = to_std_string(args[i]);
+        std::istringstream parts(to_std_string(args[i]));
+        std::string token;
+        while (parts >> token) tokens.push_back(std::move(token));
+    }
+
+    for (const std::string& arg : tokens) {
+        client_log_line("viewer: arg " + arg);
         if (starts_with(arg, "--gateway-host=")) {
             out.gateway_host = arg.substr(std::string("--gateway-host=").size());
             out.offline = false;
@@ -64,6 +81,11 @@ ViewerOptions parse_options(const GKC::ConstArray<GKC::ConstStringS>& args) {
             out.offline = true;
         }
     }
+    client_log_line("viewer: options offline=" +
+                    std::to_string(out.offline ? 1 : 0) +
+                    " host=" + out.gateway_host +
+                    " port=" + std::to_string(out.gateway_port) +
+                    " app=" + out.app_name);
     return out;
 }
 
@@ -114,8 +136,14 @@ public:
 
     bool Start(const ViewerOptions& options) {
         options_ = options;
-        if (!Create(true, kWindowWidth, kWindowHeight)) return false;
+        if (!Create(true, kDisplayWidth, kDisplayHeight)) {
+            client_log_line("viewer: Create failed");
+            return false;
+        }
+        client_log_line("viewer: window created");
         Show(true);
+        client_log_line("viewer: window shown");
+        DamageFull();
 
         if (!options_.offline) {
             ClientRuntime::Options runtime_options;
@@ -125,25 +153,40 @@ public:
             runtime_options.connect_gateway = true;
             runtime_.start(runtime_options, &renderer_,
                            [this]() { repaint_work_.PostWork(); });
+            client_log_line("viewer: runtime started");
+        } else {
+            client_log_line("viewer: offline mode");
         }
         return true;
     }
 
     void DoDraw(GKC::UiMessageDraw* pDraw) noexcept {
         if (pDraw == nullptr) return;
-        renderer_.blit(pDraw->pBuffer, pDraw->iWidth, pDraw->iHeight,
-                       pDraw->rcPaint);
+        if (draw_count_ < 8) {
+            client_log_line("viewer: DoDraw dst=" +
+                            std::to_string(pDraw->iWidth) + "x" +
+                            std::to_string(pDraw->iHeight) + " paint=" +
+                            std::to_string(pDraw->rcPaint.L()) + "," +
+                            std::to_string(pDraw->rcPaint.T()) + "," +
+                            std::to_string(pDraw->rcPaint.R()) + "," +
+                            std::to_string(pDraw->rcPaint.B()));
+        }
+        ++draw_count_;
+        renderer_.blit_scaled_to_fit(pDraw->pBuffer, pDraw->iWidth,
+                                     pDraw->iHeight, pDraw->rcPaint);
     }
 
     void DoMouse(GKC::UiMessageMouse* pMouse) noexcept {
         if (pMouse == nullptr) return;
+        const int logical_x = (pMouse->x * kWindowWidth) / kDisplayWidth;
+        const int logical_y = (pMouse->y * kWindowHeight) / kDisplayHeight;
         const InputEventType type = mouse_event_type(*pMouse);
         runtime_.send_input_event(
-            pack_mouse_input_event(type, pMouse->x, pMouse->y, timestamp_us()));
+            pack_mouse_input_event(type, logical_x, logical_y, timestamp_us()));
 
         if (type == InputEventType::MOUSE_LEFT_DOWN &&
-            pMouse->x >= kSmallLeft && pMouse->x < kSmallRight &&
-            pMouse->y >= kSmallTop && pMouse->y < kSmallBottom) {
+            logical_x >= kSmallLeft && logical_x < kSmallRight &&
+            logical_y >= kSmallTop && logical_y < kSmallBottom) {
             yellow_rect_ = !yellow_rect_;
             renderer_.paint_demo(yellow_rect_, cyan_background_);
             DamageFull();
@@ -166,12 +209,12 @@ public:
 
     void DoClose() noexcept {
         runtime_.stop();
-        GKC::GuiHelper::Quit();
+        ::PostQuitMessage(0);
     }
 
     void DamageFull() noexcept {
         GKC::UiRect r;
-        r.Set(0, 0, kWindowWidth, kWindowHeight);
+        r.Set(0, 0, kDisplayWidth, kDisplayHeight);
         Damage(r);
     }
 
@@ -182,6 +225,7 @@ private:
     RepaintWork repaint_work_;
     bool yellow_rect_ = false;
     bool cyan_background_ = false;
+    int draw_count_ = 0;
 };
 
 void RepaintWork::DoWork() noexcept {
@@ -202,7 +246,33 @@ public:
 
         ViewerWindow win;
         if (!win.Start(parse_options(args))) return 1;
-        return GuiHelper::Loop();
+        client_log_line("viewer: entering message pump");
+
+        // UWM_USER_EVENT mirrors GKC's _w_message_loop_impl: WM_USER + 100.
+        // Cross-thread PostWork() arrives as a thread message (msg.hwnd=NULL)
+        // with msg.message == UWM_USER_EVENT, msg.wParam == work_proc::Exec
+        // (function pointer) and msg.lParam == work_proc context. We must
+        // dispatch this inline because DispatchMessageW skips thread messages.
+        constexpr UINT kUserEvent = WM_USER + 100;
+
+        MSG msg{};
+        for (;;) {
+            BOOL got = ::GetMessageW(&msg, NULL, 0, 0);
+            if (got == 0) break;          // WM_QUIT
+            if (got == -1) break;         // GetMessage failed
+            if (msg.hwnd == NULL && msg.message == kUserEvent) {
+                using ExecFn = void (*)(void*) noexcept;
+                ExecFn exec = reinterpret_cast<ExecFn>(msg.wParam);
+                if (exec != nullptr) {
+                    exec(reinterpret_cast<void*>(msg.lParam));
+                }
+                continue;
+            }
+            ::TranslateMessage(&msg);
+            ::DispatchMessageW(&msg);
+        }
+        client_log_line("viewer: pump exited");
+        return 0;
     }
 };
 

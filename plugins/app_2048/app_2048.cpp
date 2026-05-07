@@ -3,18 +3,24 @@
 // Canvas:
 //   * 160 x 200 ARGB logical canvas (matches docs/design/2048.md).
 //   * Layout:
-//       y =   0 ..  24  header   (logo "2048" + current score)
-//       y =  28 .. 172  board    (4 x 4 tiles, 36 px pitch, origin x=8)
-//       y = 180 .. 200  status   (empty when playing, red bar on GAME OVER)
+//       y =   0 ..  24  header        (logo "2048" + current score)
+//       y =  28 .. 172  board         (4 x 4 tiles, 36 px pitch, origin x=8)
+//       y = 176 .. 194  bottom strip  (RESET button + GAME OVER indicator)
 //
 // Game state lives entirely in app_2048::Board (plugins/app_2048/app_2048_logic.*).
-// The plugin only reads the board during DoDraw and forwards keyboard events
-// to Board::move / Board::reset in DoKeyboard.  After any state change we call
-// Damage(full window) so AppHost re-paints and emits a single PIXEL_DATA frame.
+// The plugin only reads the board during DoDraw and forwards input events to
+// Board::move / Board::reset in DoKeyboard / DoMouse.  After any state change
+// we call Damage(full window) so AppHost re-paints and emits a single
+// PIXEL_DATA frame.
 //
-// Inputs (KEY_DOWN only):
-//   * KB_Left  / KB_Right / KB_Up / KB_Down  → Board::move(direction)
-//   * KB_F2                                  → Board::reset(new_seed)
+// Inputs:
+//   * KEY_DOWN KB_Left / KB_Right / KB_Up / KB_Down  → Board::move(direction)
+//   * KEY_DOWN KB_F2                                 → do_reset()
+//   * MOUSE_LEFT_DOWN inside RESET button rect       → do_reset()
+//
+// F2 and the RESET button click both call the same do_reset() helper; this is
+// the "calls the same reset path as F2 at the application boundary" contract
+// from docs/design/2048.md.
 //
 // Merge highlight: Board::merged_this_turn(x,y) is set on the tile produced by
 // a merge during the most recent move, and cleared at the start of the next
@@ -29,13 +35,21 @@
 #include "base/GkcGui.h"
 
 #include "plugins/app_2048/app_2048_logic.h"
+#include "plugins/app_2048/app_2048_view.h"
 
 namespace {
 
 // ── Layout constants ──────────────────────────────────────────────────────
+//
+// Canvas size and reset-button rect come from plugins/app_2048/app_2048_view.h
+// so the integration test can hit the same coordinates the plugin draws.
 
-constexpr int kCanvasW = 160;
-constexpr int kCanvasH = 200;
+using app_2048::kCanvasW;
+using app_2048::kCanvasH;
+using app_2048::kResetButtonLeft;
+using app_2048::kResetButtonTop;
+using app_2048::kResetButtonRight;
+using app_2048::kResetButtonBottom;
 
 constexpr int kHeaderH = 24;
 
@@ -45,8 +59,13 @@ constexpr int kBoardOriginY = 28;
 constexpr int kTilePitch    = 36;
 constexpr int kTileInset    = 2;   // gap from cell edge to tile colour fill
 
-constexpr int kStatusY      = 180;
-constexpr int kStatusH      = 20;
+// Game-over indicator on the right side of the bottom strip, separate from
+// the reset button on the left.  Same vertical band so the two share the
+// "controls strip" visually.
+constexpr int kGameOverLeft   = 80;
+constexpr int kGameOverTop    = kResetButtonTop;
+constexpr int kGameOverRight  = kCanvasW - 4;
+constexpr int kGameOverBottom = kResetButtonBottom;
 
 // 5x7 bitmap font for the digits 0..9.  One bit per pixel, MSB on the left
 // of each row, low 5 bits used.  Designed for readability at display-scale 4
@@ -78,6 +97,22 @@ constexpr uint8_t kDigitGlyphs[10][kGlyphH] = {
     {0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100},
 };
 
+// 5x7 bitmaps for the letters that appear on the RESET button.  Kept as a
+// minimal set (R, E, S, T) — the spec explicitly allows a "simple equivalent
+// state prompt" elsewhere, so we do not need a full alphabet.
+constexpr uint8_t kLetterR[kGlyphH] = {
+    0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+};
+constexpr uint8_t kLetterE[kGlyphH] = {
+    0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+};
+constexpr uint8_t kLetterS[kGlyphH] = {
+    0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+};
+constexpr uint8_t kLetterT[kGlyphH] = {
+    0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+};
+
 // ── Colour palette ─────────────────────────────────────────────────────────
 
 constexpr color_quad kColorBackground   = COLOR_QUAD_MAKE( 28,  36,  44, 255);
@@ -88,6 +123,9 @@ constexpr color_quad kColorTextLight    = COLOR_QUAD_MAKE(245, 245, 245, 255);
 constexpr color_quad kColorScore        = COLOR_QUAD_MAKE(245, 245, 245, 255);
 constexpr color_quad kColorLogo         = COLOR_QUAD_MAKE(255, 200,  80, 255);
 constexpr color_quad kColorGameOver     = COLOR_QUAD_MAKE(200,  40,  40, 255);
+constexpr color_quad kColorButton       = COLOR_QUAD_MAKE( 80, 130, 180, 255);
+constexpr color_quad kColorButtonBorder = COLOR_QUAD_MAKE(140, 180, 220, 255);
+constexpr color_quad kColorButtonText   = COLOR_QUAD_MAKE(245, 245, 245, 255);
 
 // Tile background colours by value.  Anything above 4096 reuses the highest
 // entry; the spec doesn't require unique colours past that.
@@ -205,6 +243,37 @@ int number_width(uint32_t value) {
     return n * kGlyphW + (n - 1) * kGlyphSpacing;
 }
 
+// Draw an arbitrary 5x7 glyph (digit or letter) at (x, y).  Used for the
+// "RESET" button label so we don't need a generic font system.
+void draw_glyph(color_quad* buf, int stride,
+                int x, int y, const uint8_t glyph[kGlyphH], color_quad fg) {
+    for (int row = 0; row < kGlyphH; ++row) {
+        const uint8_t bits = glyph[row];
+        for (int col = 0; col < kGlyphW; ++col) {
+            if (bits & (1u << (kGlyphW - 1 - col)))
+                put_pixel(buf, stride, x + col, y + row, fg);
+        }
+    }
+}
+
+// Draw the literal string "RESET" left-to-right starting at (x, y).  Returns
+// the width consumed in pixels.  No general-purpose text engine — this is
+// the only string the plugin renders.
+int draw_reset_label(color_quad* buf, int stride, int x, int y, color_quad fg) {
+    const uint8_t* glyphs[5] = {
+        kLetterR, kLetterE, kLetterS, kLetterE, kLetterT,
+    };
+    int w = 0;
+    for (int i = 0; i < 5; ++i) {
+        draw_glyph(buf, stride, x + w, y, glyphs[i], fg);
+        w += kGlyphW;
+        if (i + 1 < 5) w += kGlyphSpacing;
+    }
+    return w;
+}
+
+constexpr int kResetLabelWidth = 5 * kGlyphW + 4 * kGlyphSpacing;
+
 // ── Window ─────────────────────────────────────────────────────────────────
 
 class App2048Window : public GKC::ToplevelImpl<App2048Window> {
@@ -230,7 +299,7 @@ public:
 
         draw_header(pDraw->pBuffer, stride);
         draw_board(pDraw->pBuffer, stride);
-        draw_status(pDraw->pBuffer, stride);
+        draw_bottom_strip(pDraw->pBuffer, stride);
     }
 
     void DoKeyboard(GKC::UiMessageKeyboard* pKb) noexcept {
@@ -243,23 +312,27 @@ public:
         case 0x26 /* KB_Up    */: changed = board_.move(app_2048::Direction::Up   ).changed; break;
         case 0x27 /* KB_Right */: changed = board_.move(app_2048::Direction::Right).changed; break;
         case 0x28 /* KB_Down  */: changed = board_.move(app_2048::Direction::Down ).changed; break;
-        case 0x71 /* KB_F2    */: {
-            // F2 always restarts, even from GameOver.  Pull a fresh seed from
-            // rng_ so successive resets in one session diverge.
-            std::uniform_int_distribution<uint64_t> pick;
-            board_.reset(pick(rng_));
-            changed = true;
-            break;
-        }
+        case 0x71 /* KB_F2    */:
+            do_reset();
+            return;  // do_reset already issues Damage(full).
         default:
             return;
         }
 
-        if (changed) {
-            GKC::UiRect r;
-            r.Set(0, 0, kCanvasW, kCanvasH);
-            Damage(r);
-        }
+        if (changed) damage_full();
+    }
+
+    // RESET button handling.  We trigger on MOUSE_LEFT_DOWN inside the button
+    // rect (per docs/design/2048.md "Reset Button" — preferred trigger).
+    // Other mouse events (move, up, right-click, clicks outside the button)
+    // are intentionally dropped without Damage so they don't generate
+    // spurious frames; tile clicks are explicitly out-of-scope for MVP.
+    void DoMouse(GKC::UiMessageMouse* pMouse) noexcept {
+        if (pMouse == nullptr) return;
+        if (pMouse->uEvent  != MOUSE_EVENT_DOWN)  return;
+        if (pMouse->btButton != MOUSE_BUTTON_LEFT) return;
+        if (!app_2048::point_in_reset_button(pMouse->x, pMouse->y)) return;
+        do_reset();
     }
 
     void DoClose() noexcept { GKC::GuiHelper::Quit(); }
@@ -326,15 +399,52 @@ private:
         draw_number(buf, stride, text_x, text_y, value, pal.text);
     }
 
-    void draw_status(color_quad* buf, int stride) {
-        if (board_.state() != app_2048::GameState::GameOver) return;
-        // Solid red bar across the bottom — minimal "GAME OVER" cue without
-        // needing letter glyphs.  Exact text is out of scope per the spec
-        // ("GAME OVER 或等价的简单状态提示").
+    void draw_bottom_strip(color_quad* buf, int stride) {
+        // RESET button on the left.  Drawn unconditionally so the user can
+        // see and click it from the very first frame.
+        const int btn_w = kResetButtonRight  - kResetButtonLeft;
+        const int btn_h = kResetButtonBottom - kResetButtonTop;
+
+        // 1-pixel button border so the click target is visually distinct.
         fill_rect(buf, stride,
-                  4, kStatusY,
-                  kCanvasW - 4, kStatusY + kStatusH,
-                  kColorGameOver);
+                  kResetButtonLeft  - 1, kResetButtonTop    - 1,
+                  kResetButtonRight + 1, kResetButtonBottom + 1,
+                  kColorButtonBorder);
+        fill_rect(buf, stride,
+                  kResetButtonLeft, kResetButtonTop,
+                  kResetButtonRight, kResetButtonBottom,
+                  kColorButton);
+
+        // Centre the "RESET" label inside the button.
+        const int label_x = kResetButtonLeft + (btn_w - kResetLabelWidth) / 2;
+        const int label_y = kResetButtonTop  + (btn_h - kGlyphH) / 2;
+        draw_reset_label(buf, stride, label_x, label_y, kColorButtonText);
+
+        // Game-over indicator on the right side of the strip.  Solid red
+        // when GameOver, otherwise leaves the background visible — the
+        // indicator is intentionally small text-free per the spec
+        // ("GAME OVER 或等价的简单状态提示").
+        if (board_.state() == app_2048::GameState::GameOver) {
+            fill_rect(buf, stride,
+                      kGameOverLeft, kGameOverTop,
+                      kGameOverRight, kGameOverBottom,
+                      kColorGameOver);
+        }
+    }
+
+    // Reset path shared by KB_F2 and RESET-button click.  Draws a fresh seed
+    // from rng_ so successive resets diverge, then issues Damage(full) so the
+    // next frame reflects the cleared board and zeroed score.
+    void do_reset() {
+        std::uniform_int_distribution<uint64_t> pick;
+        board_.reset(pick(rng_));
+        damage_full();
+    }
+
+    void damage_full() {
+        GKC::UiRect r;
+        r.Set(0, 0, kCanvasW, kCanvasH);
+        Damage(r);
     }
 
     app_2048::Board   board_{0};

@@ -11,6 +11,7 @@
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <mutex>
@@ -21,6 +22,33 @@
 #include <vector>
 
 namespace {
+
+// IoPool's send buffer is fixed at 4000 bytes (BUFFER_SIZE in
+// third_party/GKC/RT/GkcSys/include/base/system/Linux/sys_io.h:24).  BeginInput
+// blindly returns that buffer for any uLen the caller supplies — the bounds
+// assert is compiled out in release builds — so passing a uLen > 4000 stomps
+// the heap during the subsequent memcpy and crashes once the next allocation
+// touches the corrupted region.  All packets larger than this must therefore
+// be split into ≤ kIoPoolMaxChunk pieces before being handed to BeginInput.
+// TCP delivers the wire bytes as a stream, so chunking is invisible to the
+// peer's MessageParser.
+constexpr size_t kIoPoolMaxChunk = 4000;
+
+void push_chunked(std::queue<std::vector<uint8_t>>& q,
+                  std::vector<uint8_t> data) {
+    if (data.empty()) return;
+    if (data.size() <= kIoPoolMaxChunk) {
+        q.push(std::move(data));
+        return;
+    }
+    size_t off = 0;
+    while (off < data.size()) {
+        const size_t take = std::min(kIoPoolMaxChunk, data.size() - off);
+        q.emplace(data.begin() + static_cast<std::ptrdiff_t>(off),
+                  data.begin() + static_cast<std::ptrdiff_t>(off + take));
+        off += take;
+    }
+}
 
 std::vector<uint8_t> serialize_packet(const Packet& pkt) {
     std::vector<uint8_t> out(HEADER_SIZE + pkt.body.size());
@@ -83,6 +111,20 @@ bool parse_spawn_app_name(const Packet& pkt, std::string* out) {
         return false;
     *out = std::move(name);
     return true;
+}
+
+const char* cmd_type_name(CmdType cmd) {
+    switch (cmd) {
+    case CmdType::HEARTBEAT:      return "HEARTBEAT";
+    case CmdType::SPAWN_APP:      return "SPAWN_APP";
+    case CmdType::SESSION_ACK:    return "SESSION_ACK";
+    case CmdType::APPHOST_READY:  return "APPHOST_READY";
+    case CmdType::PIXEL_DATA:     return "PIXEL_DATA";
+    case CmdType::INPUT_EVENT:    return "INPUT_EVENT";
+    case CmdType::CLOSE_SESSION:  return "CLOSE_SESSION";
+    case CmdType::ERROR_RESP:     return "ERROR_RESP";
+    default:                      return "UNKNOWN";
+    }
 }
 
 } // namespace
@@ -216,6 +258,10 @@ struct Gateway::Impl {
         if (!was_active)
             return;
 
+        std::fprintf(stderr, "[gateway] client disconnected  id=%lu session=%u\n",
+                     static_cast<unsigned long>(conn->id_),
+                     static_cast<unsigned>(session_id));
+
         if (session_id != 0) {
             const uintptr peer = sessions_.find_apphost(session_id);
             sessions_.remove_session(session_id);
@@ -246,6 +292,10 @@ struct Gateway::Impl {
         if (!was_active)
             return;
 
+        std::fprintf(stderr, "[gateway] apphost disconnected  id=%lu session=%u\n",
+                     static_cast<unsigned long>(conn->id_),
+                     static_cast<unsigned>(session_id));
+
         if (session_id != 0) {
             const uintptr peer = sessions_.find_client(session_id);
             sessions_.remove_session(session_id);
@@ -270,6 +320,9 @@ struct Gateway::Impl {
         if (conn == nullptr)
             return 0;
 
+        std::fprintf(stderr, "[gateway] client connected  id=%lu\n",
+                     static_cast<unsigned long>(param));
+
         bool cancelled = false;
         self->pool_.GetFunc()->SetHandleFunc(
             self->pool_.GetContext(), param, conn->io_func_, conn, cancelled);
@@ -287,6 +340,9 @@ struct Gateway::Impl {
         AppHostSession* conn = self->alloc_apphost(param);
         if (conn == nullptr)
             return 0;
+
+        std::fprintf(stderr, "[gateway] apphost connected  id=%lu\n",
+                     static_cast<unsigned long>(param));
 
         bool cancelled = false;
         self->pool_.GetFunc()->SetHandleFunc(
@@ -336,21 +392,32 @@ struct Gateway::Impl {
             atomic_compare_exchange((int&)client_lock_, 1, 0);
             return;
         }
-        // If client->send_queue_ is not empty, return 
-        if (!conn->send_queue_.empty()) {
-            conn->send_queue_.push(std::move(data));
+
+        // Split the packet into IoPool-sized chunks before queueing.  A
+        // single PIXEL_DATA frame for a 160x200 canvas is ~128 KB; without
+        // chunking, BeginInput corrupts the 4 KB send buffer and crashes.
+        const bool was_idle = conn->send_queue_.empty();
+        push_chunked(conn->send_queue_, std::move(data));
+        if (!was_idle || conn->send_queue_.empty()) {
+            // Earlier chunks are still in flight; the existing drain path
+            // (IO_TYPE_SENT → schedule_client_drain) will pick up the new
+            // tail when iSend clears.
             atomic_compare_exchange((int&)client_lock_, 1, 0);
             return;
         }
 
+        // Eager fast path: queue was empty, so iSend is also clear.  Hand
+        // the head chunk to BeginInput; if BeginInput refuses (busy or pool
+        // cancelled) we leave the chunk in the queue and rely on drain.
+        const auto& chunk = conn->send_queue_.front();
         bool cancelled = false;
         byte* raw = pool_.GetFunc()->BeginInput(
-            pool_.GetContext(), conn->id_, static_cast<uint>(data.size()), cancelled);
+            pool_.GetContext(), conn->id_,
+            static_cast<uint>(chunk.size()), cancelled);
         if (raw && !cancelled) {
-            std::memcpy(raw, data.data(), data.size());
+            std::memcpy(raw, chunk.data(), chunk.size());
+            conn->send_queue_.pop();
             pool_.GetFunc()->EndInput(pool_.GetContext(), conn->id_);
-        } else if (!cancelled) {
-            conn->send_queue_.push(std::move(data));
         }
         atomic_compare_exchange((int&)client_lock_, 1, 0);
     }
@@ -361,20 +428,23 @@ struct Gateway::Impl {
             atomic_compare_exchange((int&)apphost_lock_, 1, 0);
             return;
         }
-        if (!conn->send_queue_.empty()) {
-            conn->send_queue_.push(std::move(data));
+
+        const bool was_idle = conn->send_queue_.empty();
+        push_chunked(conn->send_queue_, std::move(data));
+        if (!was_idle || conn->send_queue_.empty()) {
             atomic_compare_exchange((int&)apphost_lock_, 1, 0);
             return;
         }
 
+        const auto& chunk = conn->send_queue_.front();
         bool cancelled = false;
         byte* raw = pool_.GetFunc()->BeginInput(
-            pool_.GetContext(), conn->id_, static_cast<uint>(data.size()), cancelled);
+            pool_.GetContext(), conn->id_,
+            static_cast<uint>(chunk.size()), cancelled);
         if (raw && !cancelled) {
-            std::memcpy(raw, data.data(), data.size());
+            std::memcpy(raw, chunk.data(), chunk.size());
+            conn->send_queue_.pop();
             pool_.GetFunc()->EndInput(pool_.GetContext(), conn->id_);
-        } else if (!cancelled) {
-            conn->send_queue_.push(std::move(data));
         }
         atomic_compare_exchange((int&)apphost_lock_, 1, 0);
     }
@@ -485,6 +555,13 @@ struct Gateway::Impl {
         conn->parser_.feed(data, len);
         Packet pkt;
         while (conn->parser_.next_packet(pkt) == ParseResult::OK) {
+            std::fprintf(stderr,
+                         "[gateway] recv from client  id=%lu cmd=%s session=%u body=%u\n",
+                         static_cast<unsigned long>(conn->id_),
+                         cmd_type_name(pkt.header.cmd_type),
+                         static_cast<unsigned>(pkt.header.session_id),
+                         static_cast<unsigned>(pkt.header.body_length));
+
             if (conn->session_id_ != 0)
                 sessions_.mark_client_seen(conn->session_id_, GatewayClock::now());
             switch (pkt.header.cmd_type) {
@@ -508,6 +585,13 @@ struct Gateway::Impl {
         conn->parser_.feed(data, len);
         Packet pkt;
         while (conn->parser_.next_packet(pkt) == ParseResult::OK) {
+            std::fprintf(stderr,
+                         "[gateway] recv from apphost id=%lu cmd=%s session=%u body=%u\n",
+                         static_cast<unsigned long>(conn->id_),
+                         cmd_type_name(pkt.header.cmd_type),
+                         static_cast<unsigned>(pkt.header.session_id),
+                         static_cast<unsigned>(pkt.header.body_length));
+
             if (pkt.header.session_id != 0)
                 sessions_.mark_apphost_seen(pkt.header.session_id, GatewayClock::now());
             switch (pkt.header.cmd_type) {
@@ -577,6 +661,12 @@ struct Gateway::Impl {
             return;
         }
         sessions_.set_apphost_pid(session_id, static_cast<int>(proc.pid));
+
+        std::fprintf(stderr,
+                     "[gateway] spawned apphost  session=%u app=%s pid=%d\n",
+                     static_cast<unsigned>(session_id), app_name.c_str(),
+                     static_cast<int>(proc.pid));
+
         // The client is not acknowledged here. The forked AppHost must first
         // connect back to the internal listener and send APPHOST_READY so the
         // session can be bound to a concrete AppHost socket.
@@ -600,6 +690,11 @@ struct Gateway::Impl {
         atomic_compare_exchange((int&)client_lock_, 1, 0);
 
         if (config_.auto_spawn_apphost && route.client_conn != 0) {
+            std::fprintf(stderr,
+                         "[gateway] SESSION_ACK  session=%u -> client id=%lu\n",
+                         static_cast<unsigned>(session_id),
+                         static_cast<unsigned long>(route.client_conn));
+
             // Only after the AppHost socket is bound can the client safely send
             // INPUT_EVENT messages that Gateway can route to the correct peer.
             send_to_client(route.client_conn, make_packet(CmdType::SESSION_ACK, session_id));
@@ -608,17 +703,31 @@ struct Gateway::Impl {
 
     void forward_to_apphost(const Packet& pkt) {
         const uintptr target = sessions_.find_apphost(pkt.header.session_id);
-        if (target != 0)
+        if (target != 0) {
             send_to_apphost(target, serialize_packet(pkt));
+        } else {
+            std::fprintf(stderr,
+                         "[gateway] drop client->apphost (no route)  cmd=%s session=%u\n",
+                         cmd_type_name(pkt.header.cmd_type),
+                         static_cast<unsigned>(pkt.header.session_id));
+        }
     }
 
     void forward_to_client(const Packet& pkt) {
         const uintptr target = sessions_.find_client(pkt.header.session_id);
-        if (target != 0)
+        if (target != 0) {
             send_to_client(target, serialize_packet(pkt));
+        } else {
+            std::fprintf(stderr,
+                         "[gateway] drop apphost->client (no route)  cmd=%s session=%u\n",
+                         cmd_type_name(pkt.header.cmd_type),
+                         static_cast<unsigned>(pkt.header.session_id));
+        }
     }
 
     void close_session(uint32_t session_id) {
+        std::fprintf(stderr, "[gateway] session close  session=%u\n",
+                     static_cast<unsigned>(session_id));
         const auto route = sessions_.find(session_id);
         int pid = -1;
         sessions_.get_pid(session_id, &pid);
@@ -667,6 +776,11 @@ struct Gateway::Impl {
             _IoPool_Disable();
             return false;
         }
+
+        std::fprintf(stderr,
+                     "[gateway] listening on public=:%u apphost_internal=:%u\n",
+                     static_cast<unsigned>(config_.public_port),
+                     static_cast<unsigned>(config_.apphost_internal_port));
 
         running_.store(true, std::memory_order_release);
         monitor_thread_ = std::thread([this] { monitor_loop(); });
@@ -719,6 +833,10 @@ struct Gateway::Impl {
     }
 
     void fail_session(uint32_t session_id, bool notify_client_error) {
+        std::fprintf(stderr, "[gateway] session fail  session=%u notify_client=%d\n",
+                     static_cast<unsigned>(session_id),
+                     notify_client_error ? 1 : 0);
+
         SessionTable::Route route{};
         int pid = -1;
         if (!sessions_.transition_to_closing(session_id, &route, &pid))
@@ -737,6 +855,8 @@ struct Gateway::Impl {
     void stop() {
         if (!running_.exchange(false, std::memory_order_acq_rel))
             return;
+
+        std::fprintf(stderr, "[gateway] shutting down...\n");
 
         if (monitor_thread_.joinable())
             monitor_thread_.join();

@@ -12,7 +12,6 @@ cc_test(
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],
-    copts = ["-std=c++17"],
 )
 
 cc_library(
@@ -23,7 +22,6 @@ cc_library(
         "//src/protocol:protocol",
         "//src/protocol:message_parser",
     ],
-    copts = ["-std=c++17"],
     visibility = ["//visibility:public"],
 )
 
@@ -36,7 +34,6 @@ cc_test(
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],
-    copts = ["-std=c++17"],
 )
 
 # INPUT_EVENT body pack/parse helper (M5).  Exposes GKC::UiMessage* in its
@@ -49,7 +46,6 @@ cc_library(
         ":byte_order",
         "//third_party:GkcSys",
     ],
-    copts = ["-std=c++17"],
     visibility = ["//visibility:public"],
 )
 
@@ -62,5 +58,4 @@ cc_test(
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],
-    copts = ["-std=c++17"],
 )

@@ -26,21 +26,36 @@ Do not proceed with implementation until you have confirmed you have read the re
 
 ## Build & Test
 
+Build system: Bazel 7.4.1. Always use `bazel build` / `bazel test` — do not use cmake or make directly.
+
+Before running any build or test command, first identify the current OS/environment and choose targets for that side only. The project is intentionally split after M6:
+
+- **Windows side**: Client executable and viewer plugin work.
+  - Primary areas: `src/client/`, `plugins/client_viewer/`, client-facing shared code in `src/common/` and `src/protocol/`.
+  - Build/test client targets only, such as `//src/client:client`, `//src/client:pixel_renderer_test`, `//src/client:m6_client_test` when present, and `//plugins/client_viewer:client_viewer`.
+  - Do not build or test Linux-only Gateway/AppHost targets from Windows unless explicitly requested.
+- **Linux side**: Gateway, AppHost, server-side plugins, protocol, and integration tests.
+  - Primary areas: `src/gateway/`, `src/apphost/`, server plugins under `plugins/`, plus shared code in `src/common/` and `src/protocol/`.
+  - Build/test Linux server targets only, such as `//src/gateway:gateway_bin`, `//src/gateway:gateway_test`, `//src/gateway:gateway_lifecycle_test`, `//src/gateway:gateway_m4_plugin_test`, `//src/gateway:gateway_m5_input_test`, `//src/apphost:apphost_bin`, and AppHost tests.
+  - Do not build or test Windows-only client executable/viewer targets from Linux unless the target is explicitly known to be portable and relevant to the change.
+
+Avoid `bazel build //...` and `bazel test //...` by default. Full-repo builds mix Windows-only and Linux-only targets and can fail for environment reasons unrelated to the change. Only run full-repo commands when the user explicitly asks for them or after confirming the current platform supports all selected targets.
+
 ```bash
-# Build a specific target
+# Build a specific target.
 bazel build //src/protocol:message_parser
 
-# Run a specific test
+# Run a specific test.
 bazel test //src/protocol:message_parser_test
 
-# Build everything
-bazel build //...
+# Linux Gateway/AppHost examples.
+bazel test //src/gateway:gateway_m5_input_test
+bazel build //src/gateway:gateway_bin //src/apphost:apphost_bin
 
-# Run all tests
-bazel test //...
+# Windows Client examples.
+bazel test //src/client:pixel_renderer_test
+bazel build //src/client:client //plugins/client_viewer:client_viewer
 ```
-
-Build system: Bazel 7.4.1. Always use `bazel build` / `bazel test` — do not use cmake or make directly.
 
 ## Testing Policy
 

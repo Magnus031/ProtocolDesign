@@ -18,7 +18,7 @@
 
 ## 1. 项目简介
 
-本项目是一个用 **C++14** 编写的、基于 **TCP** 的应用级 UI 虚拟化通信协议实现系统。
+本项目是一个用 **C++17** 编写的、基于 **TCP** 的应用级 UI 虚拟化通信协议实现系统。
 
 ### 核心理念
 
@@ -52,10 +52,10 @@
 │     Client       │    TCP 长连接   │     Gateway      │    TCP 长连接   │    AppHost(s)    │
 │   (GKC 客户端)   │◄──────────────►│   (智能网关)      │◄──────────────►│  (应用宿主进程)   │
 │                  │                │                  │                │                  │
-│ · 像素重构(DoDraw)│   单端口接入    │ · Session 管理    │   动态路由      │ · 加载业务 .so    │
+│ · 像素重构(DoDraw)│  Client 端口    │ · Session 管理    │  AppHost 内部端口│ · 加载业务 .so    │
 │ · 输入事件采集    │                │ · 动态路由转发     │                │ · 本地渲染        │
-│ · GKC 窗口管理   │                │ · 进程生命周期     │                │ · 脏矩形检测      │
-│                  │                │ · epoll 多路复用   │                │ · 像素差分发送     │
+│ · GKC 窗口管理   │                │ · 进程生命周期     │                │ · 脏矩形捕获      │
+│                  │                │ · epoll 多路复用   │                │ · 像素块发送       │
 └──────────────────┘                └──────────────────┘                └──────────────────┘
 ```
 
@@ -74,13 +74,13 @@
 ```
                     ┌─────────────────────────────────┐
                     │           Gateway               │
-  Client_1 ────────►│                                 │────────► AppHost_A (app1.so)
+  Client_1 ────────►│                                 │────────► AppHost_A (demo_app)
   (Session 0x01)    │   Session 路由表                 │
                     │   ┌───────────────────────────┐ │
-  Client_2 ────────►│   │ Client_Socket ↔ Session_ID│ │────────► AppHost_B (app2.so)
+  Client_2 ────────►│   │ Client_Socket ↔ Session_ID│ │────────► AppHost_B (other_app)
   (Session 0x02)    │   │ Session_ID ↔ AppHost_Socket│ │
                     │   └───────────────────────────┘ │
-  Client_3 ────────►│                                 │────────► AppHost_C (app1.so)
+  Client_3 ────────►│                                 │────────► AppHost_C (demo_app)
   (Session 0x03)    │                                 │
                     └─────────────────────────────────┘
 ```
@@ -106,7 +106,7 @@ IoPool 线程 (GKC 内部) ──► epoll 监听客户端/AppHost 连接；_IoF
 主线程                 ──► 加载业务 .so 插件 (dlopen/dlsym)；运行 GuiHelper::Loop() 或事件循环
 IoPool 线程 (GKC 内部) ──► 与 Gateway 的网络 I/O 事件回调（RECEIVED / SENT / BEFORE_CLOSE）
 WorkPool 快速池        ──► PIXEL_DATA 打包发送（DoDraw 触发后投递，无逐帧像素比对）
-WorkPool 慢速池        ──► 像素数据压缩任务（耗时操作）
+WorkPool 慢速池        ──► 当前未用于像素压缩；可扩展为后台编码任务
 PostWork               ──► IoPool 回调将输入事件安全投递给主线程的 ui_host_impl
 ```
 
@@ -114,9 +114,9 @@ PostWork               ──► IoPool 回调将输入事件安全投递给主�
 ```
 主线程 (GKC GuiHelper::Loop)  ──► UI 事件循环；DoDraw 写像素，DoMouse/DoKeyboard 采集输入
 IoPool 线程 (GKC 内部)        ──► 网络 I/O 事件回调（IO_TYPE_RECEIVED / IO_TYPE_SENT 等）
-回调分发                      ──► IoPool 收到数据 → MessageParser.Feed() → 按 CmdType 分发
+回调分发                      ──► IoPool 收到数据 → MessageParser.feed() → 按 CmdType 分发
 PostWork                      ──► 从 IoPool 线程安全地向主线程投递像素更新任务
-WorkPool（可选）              ──► 像素解压缩等 CPU 密集任务
+WorkPool（可选）              ──► 当前 PIXEL_DATA 为未压缩 ARGB；后续可扩展为解码任务
 心跳发送                      ──► 通过 TimerImpl 在主线程定时触发，经 IoPool 发送
 ```
 
@@ -157,7 +157,7 @@ ProtocolDesign/
 │   │   └── BUILD
 │   │
 │   ├── gateway/               # 智能网关（可执行程序）
-│   │   ├── gateway.h          # 网关核心类：IoPool 监听，MessageHandler 路由
+│   │   ├── gateway.h          # 网关核心类：IoPool 监听，MessageParser 定帧与 Session 路由
 │   │   ├── gateway.cpp
 │   │   ├── session_manager.h  # SessionID ↔ (client_conn, apphost_conn) 双向映射
 │   │   ├── session_manager.cpp
@@ -224,7 +224,7 @@ ProtocolDesign/
 ```
 
 > **构建系统**：Bazel 7.4.1。可执行目标：`gateway`、`apphost`、`client`；共享库目标：`demo_app`、`client_viewer`。
-> `src/common/` 中的 `MessageHandler` 被三个可执行目标共同依赖。
+> `src/common/` 中的 `MessageHandler` 被 AppHost 依赖；Client 当前直接使用 `MessageParser` 并在运行时按 `CmdType` 分发；Gateway 只使用 `MessageParser` 定帧并按 Session 路由。
 > 当前仓库记录的 GKC submodule 快照为 `51049a4`。相较之前的 `1152096`，上游新增了基础 CGA 头文件和 multi-dimensional array 相关类型。
 
 ---
@@ -241,24 +241,25 @@ ProtocolDesign/
 
 ### 4.2 协议头（Header）格式
 
-所有消息均以一个 **固定长度 Header** 开头，后跟可变长度载荷（Body）：
+所有消息均以一个 **固定长度 13 字节 Header** 开头，后跟可变长度载荷（Body）：
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  Bytes 0-3     │  Bytes 4-7     │  Byte 8       │  Bytes 9-12      │
-│  Magic Number  │  Session ID    │  Cmd Type     │  Body Length      │
-│  (4 bytes)     │  (4 bytes BE)  │  (1 byte)     │  (4 bytes BE)    │
+┌──────────────┬──────────────┬────────────┬──────────────┬──────────────┐
+│ Bytes 0-1    │ Bytes 2-5    │ Byte 6     │ Bytes 7-10   │ Bytes 11-12  │
+│ Magic        │ Session ID   │ Cmd Type   │ Body Length  │ Reserved     │
+│ (2 bytes BE) │ (4 bytes BE) │ (1 byte)   │ (4 bytes BE) │ (2 bytes BE) │
+└──────────────┴──────────────┴────────────┴──────────────┴──────────────┘
+│ Body (bodyLength bytes)                                             │
 └──────────────────────────────────────────────────────────────────────┘
-│  Body (bodyLength bytes)                                            │
-└─────────────────────────────────────────────────────────────────────┘
 ```
 
 | 字段 | 大小 | 说明 |
 |------|------|------|
-| **Magic Number** | 4 bytes | 固定标识，用于非法包过滤与协议版本识别 |
+| **Magic** | 2 bytes (BE) | 固定 `0xBEEF`，用于非法包过滤 |
 | **Session ID** | 4 bytes (BE) | 会话标识，用于 Gateway 多应用路由映射 |
 | **Cmd Type** | 1 byte | 指令类型枚举 |
 | **Body Length** | 4 bytes (BE) | 后续载荷的字节长度 |
+| **Reserved** | 2 bytes (BE) | 保留字段，当前序列化为 0，接收端忽略 |
 
 > **BE = Big-Endian（大端序/网络字节序）**，所有多字节整数均使用大端序。
 
@@ -343,19 +344,19 @@ keyCode: GKC KB_* 枚举值，Client 侧直接从 DoKeyboard(pKb->btKey) 填入
                      │ 接收数据
                      ▼
            ┌────────────────────┐
-           │  READ_HEADER       │ ◄── 累积读满 Header 长度
+           │  WAIT_HEADER       │ ◄── 累积读满 Header 长度
            │  (缓冲区累积)       │
            └────────┬───────────┘
                     │ Header 完整
                     ▼
          ┌──────────────────────┐
          │ VALIDATE_MAGIC       │ ◄── 校验 Magic Number
-         │                      │     失败则丢弃并重新同步
+         │                      │     失败则进入 POISONED 状态
          └────────┬─────────────┘
                   │ 校验通过
                   ▼
          ┌──────────────────────┐
-         │  READ_BODY           │ ◄── 根据 Body Length 继续累积
+         │  WAIT_BODY           │ ◄── 根据 Body Length 继续累积
          │  (缓冲区累积)         │
          └────────┬─────────────┘
                   │ Body 完整
@@ -428,7 +429,7 @@ class TimerImpl {
 | `Loop` | 进入真实 OS 事件循环 | 等待 IoPool 事件或退出信号 |
 | `PostWork` | 向真实 UI 线程投递任务 | 向主线程消息队列投递任务 |
 | 像素去哪里 | Wayland/Win32 合成器 → 屏幕 | 截获 → 打包 PIXEL_DATA → 网络 |
-| 事件从哪来 | OS 鼠标/键盘 | 网络 MOUSE_EVENT/KEYBOARD_EVENT |
+| 事件从哪来 | OS 鼠标/键盘 | 网络 `INPUT_EVENT` |
 
 **接口透明化原理**：业务 `.so` 插件只调用 `IUiHost` 接口写像素和接收事件，
 完全不知道底层是真实屏幕还是网络传输：
@@ -501,11 +502,12 @@ using ColorQuad = uint32_t;  // 0xAARRGGBB
 
 ```cpp
 #pragma pack(push, 1)
-struct ProtocolHeader {
-    uint32_t  magicNumber;    // 固定标识，过滤非法包
-    uint32_t  sessionId;      // 会话 ID（大端序）
-    uint8_t   cmdType;        // 指令类型 (CmdType 枚举)
-    uint32_t  bodyLength;     // 载荷长度（大端序）
+struct Header {
+    uint16_t magic;        // 固定 PROTOCOL_MAGIC (0xBEEF)
+    uint32_t session_id;   // 会话 ID（大端序）
+    CmdType  cmd_type;     // 指令类型
+    uint32_t body_length;  // 载荷长度（大端序）
+    uint16_t reserved;     // 保留字段，当前写 0，读取时忽略
 };
 #pragma pack(pop)
 ```
@@ -516,7 +518,7 @@ struct ProtocolHeader {
 struct DirtyRectData {
     uint32_t              frameSeq;      // 帧序列号
     ui_rect               rect;          // 脏矩形区域
-    std::vector<uint8_t>  pixelData;     // ARGB 像素数据（可压缩）
+    std::vector<uint8_t>  pixelData;     // 未压缩 ARGB 像素数据
 };
 ```
 
@@ -563,13 +565,15 @@ Gateway 是系统的中枢节点，职责远超简单转发，具备以下核心
 #### 动态路由与 Session 管理
 
 ```
-1. Client 连接 Gateway
-2. Client 发送 SPAWN_APP 指令（携带应用名）
-3. Gateway 通过 fork/exec 拉起对应 AppHost 进程
-4. Gateway 分配 Session ID，建立双向映射：
+1. Client 连接 Gateway 的 Client 监听端口
+2. Client 发送 SPAWN_APP 指令（携带逻辑应用名）
+3. Gateway 通过 allowlist 将应用名解析为插件路径
+4. Gateway 分配 Session ID，创建 SPAWNING 会话，并通过 fork/exec 拉起 AppHost 进程
+5. AppHost 连接 Gateway 的内部端口并发送 APPHOST_READY
+6. Gateway 将 Client 与 AppHost 绑定为 ACTIVE 会话，建立双向映射：
    Client_Socket ↔ Session_ID ↔ AppHost_Socket
-5. Gateway 向 Client 返回 SESSION_ACK
-6. 后续数据按 Session ID 精准路由
+7. Gateway 向 Client 返回 SESSION_ACK
+8. 后续数据按 Session ID 精准路由
 ```
 
 #### 进程生命周期管理
@@ -624,8 +628,8 @@ IoPool 线程收到输入事件后，**必须通过 PostWork 投递到主线程*
 ```
 IoPool 线程
   IO_TYPE_RECEIVED → MessageHandler.feed()
-    MOUSE_EVENT 处理器 → 反序列化 → PostWork(inject_mouse, new UiMessageMouse)
-    KEYBOARD_EVENT 处理器 → 反序列化 → PostWork(inject_keyboard, new UiMessageKeyboard)
+    INPUT_EVENT 处理器 → 按 eventType 反序列化鼠标/键盘事件
+      → PostWork(inject_mouse / inject_keyboard, new UiMessage...)
 
 主线程（PostWork 回调）
   inject_mouse → ui_host_impl.dispatch_mouse() → 插件 DoMouse()
@@ -658,8 +662,8 @@ ui_host_impl 捕获像素
 网络收到输入事件时，`ui_host_impl` 把它转成 UI 消息注入插件：
 
 ```
-IoPool 线程收到 MOUSE_EVENT
-    └─ MessageHandler 分发 → 反序列化 Body → UiMessageMouse
+IoPool 线程收到 INPUT_EVENT
+    └─ MessageHandler 分发 → 按 eventType 反序列化 Body → UiMessageMouse / UiMessageKeyboard
     └─ PostWork(inject_mouse, pMouse)          ← 跨线程投递
 
 主线程（PostWork 回调）
@@ -669,7 +673,7 @@ IoPool 线程收到 MOUSE_EVENT
             └─ 插件的 DoMouse() 被调用，坐标正确
 ```
 
-键盘事件同理：`KEYBOARD_EVENT → dispatch_keyboard() → UI_MESSAGE_KEYBOARD → DoKeyboard()`。
+键盘事件同理：`INPUT_EVENT(eventType=KEY_DOWN/KEY_UP) → dispatch_keyboard() → UI_MESSAGE_KEYBOARD → DoKeyboard()`。
 
 **ui_host_impl 需要存储什么**
 
@@ -718,7 +722,7 @@ _SA_UIMain(lcHost{real_gkc_ui_host}, args)
     ↓
 IoPool StartConnect → Gateway
     ↓
-MessageHandler 注册：SESSION_ACK / PIXEL_DATA / ERROR_RESP 处理器
+ClientRuntime 注册/实现 SESSION_ACK / PIXEL_DATA / ERROR_RESP 处理逻辑
     ↓
 发送 SPAWN_APP（携带要启动的 AppHost 插件名）
     ↓
@@ -729,8 +733,8 @@ ViewerWindow.Show(true) + GuiHelper::Loop()
 
 ```
 IoPool 线程收到 PIXEL_DATA
-    → MessageHandler.feed() → PIXEL_DATA 处理器
-        → PixelRenderer.apply_dirty_rect(rcPaint, pixels) [mutex 保护]
+    → MessageParser.feed() / next_packet() → 按 CmdType 进入 PIXEL_DATA 处理逻辑
+        → PixelRenderer.apply_pixel_data_body(body) [mutex 保护]
         → PostWork() 向主线程投递
 
 主线程 DoDraw(pDraw) 回调
@@ -740,7 +744,7 @@ IoPool 线程收到 PIXEL_DATA
 
 #### 输入事件采集（插件内）
 
-- `DoMouse(pMouse)`：直接用 `pMouse->uEvent`、`x`、`y` 打包 MOUSE_EVENT，经 IoPool 发出
+- `DoMouse(pMouse)`：直接用 `pMouse->uEvent`、`x`、`y` 打包 `INPUT_EVENT` 鼠标子类型，经 IoPool 发出
 - `DoKeyboard(pKb)`：直接用 `pKb->btKey`（`KB_*`）、`pKb->btState`（`KB_STATE_*`）打包，**无需键码映射**
 
 ### 6.4 GKC 异步回调范式
@@ -751,7 +755,7 @@ GKC 的整个事件系统基于**回调函数 + 事件驱动**，全面异步，
 |---------|---------|------|------|
 | `_IoFunc::Exec` | IoPool 内部线程 | `int(void* pCtx, int iType, uintptr uParam)` | 网络事件（收包、连接、断开） |
 | `UiMessageHandler::Process` | 主线程 | `void(void* pCtx, uint uMsg, uintptr uParam)` | UI 事件（绘制、鼠标、键盘） |
-| `WorkProc::Exec` | WorkPool 线程 | `void(void* pCtx)` | CPU 任务（pixel_capture 打包、像素解压缩） |
+| `WorkProc::Exec` | WorkPool 线程 | `void(void* pCtx)` | CPU 任务（pixel_capture 打包；未来可扩展压缩/解压） |
 
 **跨线程协作**：IoPool/WorkPool 线程完成数据处理后，通过 `g_ui_host.GetFunc()->PostWork()`，
 或对象自身继承 `WorkImpl<T>` / `TimerImpl<T>` 这两个包装类，将任务安全投递到主线程，避免竞争条件。
@@ -776,7 +780,7 @@ IoPool 线程
 - Windows 底层：IOCP 事件驱动
 - 接口统一：`StartListen` / `StartConnect` / `BeginInput` / `DisableHandle`
 
-各组件用法：Gateway 调用 `StartListen` 监听客户端并 `StartConnect` 对接 AppHost；AppHost / Client 均调用 `StartConnect` 连接 Gateway。
+各组件用法：Gateway 调用 `StartListen` 分别监听 Client 端口和 AppHost 内部端口；AppHost / Client 均调用 `StartConnect` 连接 Gateway。
 
 ### 6.6 协议层
 
@@ -883,18 +887,18 @@ lock 保护:
 Gateway 的进程调度流程：
 
 ```
-收到 SPAWN_APP("app1.so")
+收到 SPAWN_APP("demo_app")
     ↓
-检查 app1.so 是否存在且合法
+检查逻辑应用名是否在 allowlist 中，并解析为插件路径
     ↓
 fork() → 子进程
     ↓
-子进程: exec() 加载 AppHost 可执行文件，传入 app1.so 路径
+子进程: exec() 启动 AppHost 可执行文件，传入 session_id、Gateway 内部端口和插件路径
     ↓
 父进程 (Gateway):
   · 记录子进程 PID
-  · 等待 AppHost 建立 TCP 连接
-  · 建立 Session 映射
+  · 等待 AppHost 建立 TCP 连接并发送 APPHOST_READY
+  · 将会话从 SPAWNING 绑定为 ACTIVE
   · 向 Client 返回 SESSION_ACK
 ```
 
@@ -906,18 +910,18 @@ fork() → 子进程
 
 | 参数 | 值 | 说明 |
 |------|----|------|
-| GATEWAY_PORT | 可配置 | 网关监听端口 |
-| MAGIC_NUMBER | 0x50445347 | 协议标识 ("PDSG") |
+| GATEWAY_PUBLIC_PORT | 可配置 | Gateway 面向 Client 的监听端口 |
+| GATEWAY_INTERNAL_PORT | 可配置 | Gateway 面向 AppHost 的内部监听端口 |
+| PROTOCOL_MAGIC | 0xBEEF | 协议标识 |
 
 ### 协议参数
 
 | 参数 | 说明 |
 |------|------|
 | HEADER_SIZE | 协议头固定长度 (13 bytes) |
-| MAX_BODY_SIZE | 单包最大载荷大小 |
+| MAX_BODY_LENGTH | 单包最大载荷大小，当前为 64 MB |
 | HEARTBEAT_INTERVAL | 心跳包发送间隔 |
 | SESSION_TIMEOUT | 会话无活动超时时间 |
-| FRAME_RATE_LIMIT | 帧率上限（脏矩形发送频率） |
 
 ### 构建配置
 
@@ -983,7 +987,7 @@ bazel build //plugins/client_viewer:client_viewer  # → libclient_viewer.so / c
 | **IUiHost 接口解耦** | 业务逻辑与渲染引擎彻底分离，支持本地/远程模式无缝切换 |
 | **GKC rcPaint 驱动传输** | 脏矩形由 GKC DoDraw 回调天然提供，无逐帧比对，传输最小更新区域 |
 | **双端插件对称** | AppHost 和 Client 均为通用插件加载器，业务逻辑在 .so/.dll 中，可热替换 |
-| **MessageHandler 分发** | IoPool 回调内统一通过 MessageHandler 按 CmdType 分发，三个组件共用模式 |
+| **消息分发清晰** | AppHost 使用 MessageHandler 注册 CmdType 回调；Client 直接在 ClientRuntime 中按 CmdType 分发；Gateway 使用 MessageParser 定帧后只做 Session 路由 |
 | **智能网关调度** | Session 管理 + 动态路由 + 进程生命周期，支持水平扩展 |
 | **TCP 可靠传输** | 自定义二进制协议，状态机解包，解决粘包/半包问题 |
 | **进程级隔离** | fork/exec 独立进程空间，单点故障不影响全局 |
@@ -995,7 +999,7 @@ bazel build //plugins/client_viewer:client_viewer  # → libclient_viewer.so / c
 
 | 局限 | 说明 |
 |------|------|
-| 像素压缩算法 | 当前使用基础压缩，未集成硬件加速编码 |
+| 像素压缩算法 | 当前 PIXEL_DATA 使用未压缩 ARGB，未集成硬件加速编码 |
 | 音频传输 | 协议暂不支持音频流传输 |
 | 多显示器 | 暂不支持多显示器场景 |
 | GPU 加速 | 服务端渲染未利用 GPU 硬件加速 |
@@ -1006,7 +1010,7 @@ bazel build //plugins/client_viewer:client_viewer  # → libclient_viewer.so / c
 
 **场景**：用户在 Client 窗口点击鼠标 → 触发服务端 AppHost 重绘 → 像素回传至 Client 并显示。
 
-此 Demo 完整串联五个关键组件：**GKC GUI API、MessageParser、MessageHandler、IUiHost、ui_host_impl**。
+此 Demo 完整串联五个关键组件：**GKC GUI API、MessageParser、AppHost MessageHandler、IUiHost、ui_host_impl**。
 
 ### 11.1 全链路时序图
 
@@ -1043,7 +1047,7 @@ Client 主线程        Client IoPool 线程    Gateway IoPool 线程    AppHost
 ⑦ IO_TYPE_RECEIVED             │                      │                      │
   MessageParser.feed()         │                      │                      │
   next_packet(pkt)             │                      │                      │
-  MessageHandler 分发          │                      │                      │
+  ClientRuntime 按 CmdType 分发 │                      │                      │
   on_pixel_data()              │                      │                      │
   PixelRenderer.apply()        │                      │                      │
   PostWork() ──────────────────►（通知主线程重绘）       │                      │
@@ -1103,9 +1107,9 @@ void on_received(ClientSession* s, const uint8_t* data, size_t len) {
 
 **MessageParser 的作用**：TCP 是流式协议，单次 `IO_TYPE_RECEIVED` 可能只收到半个 Header，
 也可能包含多个完整包。`MessageParser` 内部状态机负责：
-1. `READ_HEADER`：累积到够 13 字节
-2. `VALIDATE_MAGIC`：校验 `0xBEEF`，非法则丢弃并重新同步
-3. `READ_BODY`：按 `body_length` 累积 Body
+1. `WAIT_HEADER`：累积到够 13 字节
+2. `VALIDATE_MAGIC`：校验 `0xBEEF`，非法则进入 `POISONED` 状态并停止继续解析
+3. `WAIT_BODY`：按 `body_length` 累积 Body
 
 `feed()` 推入原始字节，`next_packet()` 以 Pull 方式拉出完整帧，调用者无需关心边界。
 
@@ -1216,14 +1220,25 @@ AppHost → Gateway 的路径与步骤 ② 完全对称：Gateway 对 AppHost �
 
 ---
 
-#### ⑦ Client IoPool — MessageParser + MessageHandler 接收 PIXEL_DATA
+#### ⑦ Client IoPool — MessageParser + ClientRuntime 接收 PIXEL_DATA
 
 ```cpp
-// plugins/client_viewer/client_viewer.cpp — 初始化时注册
-handler_.on(CmdType::SESSION_ACK, [this](const Packet& p){ on_session_ack(p); });
-handler_.on(CmdType::PIXEL_DATA,  [this](const Packet& p){ on_pixel_data(p);  });
+// src/client/client.cpp — 收到完整 Packet 后按 CmdType 分发
+switch (pkt.header.cmd_type) {
+case CmdType::SESSION_ACK:
+    session_id_.store(pkt.header.session_id);
+    break;
+case CmdType::PIXEL_DATA:
+    renderer_->apply_pixel_data_body(pkt.body.data(), pkt.body.size());
+    break;
+case CmdType::ERROR_RESP:
+    set_error("Gateway returned ERROR_RESP");
+    break;
+default:
+    break;
+}
 
-void on_pixel_data(const Packet& pkt) {
+void handle_pixel_data(const Packet& pkt) {
     // 反序列化 PIXEL_DATA Body：
     // [frameSeq(4)][rectLeft(4)][rectTop(4)][rectRight(4)][rectBottom(4)][dataLen(4)][pixelData...]
     uint32_t rect_left  = read_be32(pkt.body.data() +  4);
@@ -1234,7 +1249,7 @@ void on_pixel_data(const Packet& pkt) {
     const uint8_t* pixels = pkt.body.data() + 24;
 
     ui_rect rc{(int)rect_left, (int)rect_top, (int)rect_right, (int)rect_bot};
-    renderer_.apply_dirty_rect(rc, pixels, data_len); // ← 写 PixelRenderer（mutex 保护）
+    renderer_->apply_pixel_data_body(pkt.body.data(), pkt.body.size()); // ← 内部写 PixelRenderer（mutex 保护）
 
     // 通知主线程重绘（GKC GUI API）
     ui_host_.GetFunc()->PostWork(ui_host_.GetContext(), trigger_redraw, this);
@@ -1267,7 +1282,7 @@ GKC 负责所有窗口合成与刷新细节，Client 插件无任何平台代码
 | 组件 | 所在位置 | 核心职责 |
 |------|---------|---------|
 | **GKC GUI API** (`ToplevelImpl<T>` / `DoDraw` / `DoMouse` / `DoKeyboard`) | client_viewer 插件（Client）；demo_app 插件（AppHost） | 统一抽象 OS GUI 事件（Wayland/Win32），开发者只实现 `DoXxx` 回调，GKC 负责平台适配和 `UiMessageHandler` 注册/分发 |
-| **MessageParser** | 三个组件均有，每个 TCP 连接独立实例 | TCP 字节流 → 完整协议帧：内部状态机（READ_HEADER → VALIDATE_MAGIC → READ_BODY），`feed()` 推入字节，`next_packet()` 拉出帧，解决粘包/半包 |
-| **MessageHandler** | AppHost、Client 有；Gateway 不需要（只做路由） | 协议帧 → 业务回调：包装 `MessageParser`，维护 `CmdType → HandlerFn` 映射，`feed()` 后自动 dispatch，调用者只需 `on(CmdType, fn)` 注册 |
+| **MessageParser** | 三个组件均有，每个 TCP 连接独立实例 | TCP 字节流 → 完整协议帧：内部状态机（WAIT_HEADER → VALIDATE_MAGIC → WAIT_BODY），`feed()` 推入字节，`next_packet()` 拉出帧，解决粘包/半包 |
+| **MessageHandler** | AppHost 使用；Client 采用等价的运行时 switch 分发；Gateway 不需要（只做路由） | 协议帧 → 业务回调：包装 `MessageParser`，维护 `CmdType → HandlerFn` 映射，`feed()` 后自动 dispatch，调用者只需 `register_handler(CmdType, fn)` 注册 |
 | **GKC IUiHost** | Client 用 GKC 真实实现；AppHost 用假实现 | GUI 宿主接口（`Loop` / `PostWork` / `CreateToplevel` / `AddTimer`），插件与底层平台的唯一接触点，两端接口相同 |
 | **ui_host_impl**（`IUiHost` 假实现） | AppHost（`src/apphost/ui_host_impl.cpp`） | 双向粘接层：① 插件 `DoDraw` → `pDraw->rcPaint` → `pixel_capture` → `PIXEL_DATA` → 网络；② 网络 `INPUT_EVENT` → `PostWork` → `dispatch_mouse/keyboard` → 插件 `DoMouse/DoKeyboard` |

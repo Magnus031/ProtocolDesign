@@ -198,11 +198,36 @@ public:
 
     void DoMouse(GKC::UiMessageMouse* pMouse) noexcept {
         if (pMouse == nullptr) return;
-        const int logical_x =
-            display_width_  > 0 ? (pMouse->x * canvas_width_)  / display_width_  : 0;
-        const int logical_y =
-            display_height_ > 0 ? (pMouse->y * canvas_height_) / display_height_ : 0;
+        // Map device-space (display_*) into logical canvas-space.  Clamp to
+        // [0, canvas-1] because integer scaling at the right/bottom edge can
+        // round up to canvas_width_ / canvas_height_, which is one past the
+        // last valid index — AppHost-side hit tests like the 2048 RESET
+        // button (rect at logical y=176..194 on a 200-tall canvas) would
+        // miss legitimate clicks near the canvas edge.
+        int logical_x = display_width_  > 0
+                            ? (pMouse->x * canvas_width_)  / display_width_
+                            : 0;
+        int logical_y = display_height_ > 0
+                            ? (pMouse->y * canvas_height_) / display_height_
+                            : 0;
+        if (logical_x < 0) logical_x = 0;
+        if (logical_y < 0) logical_y = 0;
+        if (logical_x >= canvas_width_)  logical_x = canvas_width_  - 1;
+        if (logical_y >= canvas_height_) logical_y = canvas_height_ - 1;
+
         const InputEventType type = mouse_event_type(*pMouse);
+        // Log left-button DOWN/UP only — these are the events apps act on
+        // (e.g. the 2048 RESET button).  MOUSE_MOVE arrives at every device
+        // pixel and would flood the per-PID log file.
+        if (type == InputEventType::MOUSE_LEFT_DOWN ||
+            type == InputEventType::MOUSE_LEFT_UP) {
+            client_log_line("viewer: mouse " +
+                            std::string(type == InputEventType::MOUSE_LEFT_DOWN
+                                            ? "LEFT_DOWN"
+                                            : "LEFT_UP") +
+                            " logical=" + std::to_string(logical_x) + "," +
+                            std::to_string(logical_y));
+        }
         runtime_.send_input_event(
             pack_mouse_input_event(type, logical_x, logical_y, timestamp_us()));
     }

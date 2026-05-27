@@ -5,6 +5,9 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+#include <iostream>
+
 #include "src/common/input_event.h"
 
 #include "base/GkcDef.h"
@@ -13,11 +16,47 @@ namespace {
 
 constexpr uint64_t kTs = 0x0102030405060708ull;
 
+bool test_log_enabled() {
+    return std::getenv("PD_TEST_LOG") != nullptr;
+}
+
+const char* event_name(InputEventType type) {
+    switch (type) {
+        case InputEventType::MOUSE_MOVE: return "MOUSE_MOVE";
+        case InputEventType::MOUSE_LEFT_DOWN: return "MOUSE_LEFT_DOWN";
+        case InputEventType::MOUSE_LEFT_UP: return "MOUSE_LEFT_UP";
+        case InputEventType::MOUSE_RIGHT_DOWN: return "MOUSE_RIGHT_DOWN";
+        case InputEventType::MOUSE_RIGHT_UP: return "MOUSE_RIGHT_UP";
+        case InputEventType::MOUSE_SCROLL: return "MOUSE_SCROLL";
+        case InputEventType::KEY_DOWN: return "KEY_DOWN";
+        case InputEventType::KEY_UP: return "KEY_UP";
+    }
+    return "UNKNOWN";
+}
+
+void log_body(const char* scenario, InputEventType type, size_t bytes) {
+    if (!test_log_enabled()) {
+        return;
+    }
+    std::cout << "[input-event-test] " << scenario
+              << " type=" << event_name(type)
+              << " body=" << bytes << '\n';
+}
+
+void log_parse(const char* scenario, bool ok) {
+    if (!test_log_enabled()) {
+        return;
+    }
+    std::cout << "[input-event-test] " << scenario
+              << " parse=" << (ok ? "OK" : "REJECT") << '\n';
+}
+
 }  // namespace
 
 TEST(InputEventPack, MouseBodyIs13Bytes) {
     auto body = pack_mouse_input_event(InputEventType::MOUSE_LEFT_DOWN,
                                        7, 11, kTs);
+    log_body("pack mouse", InputEventType::MOUSE_LEFT_DOWN, body.size());
     ASSERT_EQ(body.size(), INPUT_EVENT_MOUSE_BODY_SIZE);
     EXPECT_EQ(body[0],
               static_cast<uint8_t>(InputEventType::MOUSE_LEFT_DOWN));
@@ -36,6 +75,7 @@ TEST(InputEventPack, MouseBodyIs13Bytes) {
 TEST(InputEventPack, KeyboardBodyIs11Bytes) {
     auto body = pack_keyboard_input_event(InputEventType::KEY_DOWN,
                                           0x70 /*KB_F1*/, kTs);
+    log_body("pack keyboard", InputEventType::KEY_DOWN, body.size());
     ASSERT_EQ(body.size(), INPUT_EVENT_KEYBOARD_BODY_SIZE);
     EXPECT_EQ(body[0], static_cast<uint8_t>(InputEventType::KEY_DOWN));
     EXPECT_EQ(body[1], 0x00u);
@@ -44,9 +84,13 @@ TEST(InputEventPack, KeyboardBodyIs11Bytes) {
 
 TEST(InputEventParse, RejectsEmptyBody) {
     ParsedInputEvent ev;
-    EXPECT_FALSE(parse_input_event_body(nullptr, 0, ev));
+    bool ok = parse_input_event_body(nullptr, 0, ev);
+    log_parse("empty body null", ok);
+    EXPECT_FALSE(ok);
     uint8_t dummy = 0x01;
-    EXPECT_FALSE(parse_input_event_body(&dummy, 0, ev));
+    ok = parse_input_event_body(&dummy, 0, ev);
+    log_parse("empty body pointer", ok);
+    EXPECT_FALSE(ok);
 }
 
 TEST(InputEventParse, RejectsUnknownEventType) {
@@ -56,7 +100,9 @@ TEST(InputEventParse, RejectsUnknownEventType) {
         std::vector<uint8_t> body(INPUT_EVENT_MOUSE_BODY_SIZE, 0u);
         body[0] = bad;
         ParsedInputEvent ev;
-        EXPECT_FALSE(parse_input_event_body(body.data(), body.size(), ev))
+        bool ok = parse_input_event_body(body.data(), body.size(), ev);
+        log_parse("unknown event type", ok);
+        EXPECT_FALSE(ok)
             << "unexpectedly accepted eventType=0x"
             << std::hex << static_cast<int>(bad);
     }
@@ -67,19 +113,27 @@ TEST(InputEventParse, RejectsWrongLengthMouse) {
                                        1, 2, kTs);
     ParsedInputEvent ev;
     // Truncated by one byte.
-    EXPECT_FALSE(parse_input_event_body(body.data(), body.size() - 1, ev));
+    bool ok = parse_input_event_body(body.data(), body.size() - 1, ev);
+    log_parse("mouse truncated", ok);
+    EXPECT_FALSE(ok);
     // Padded by one byte.
     body.push_back(0u);
-    EXPECT_FALSE(parse_input_event_body(body.data(), body.size(), ev));
+    ok = parse_input_event_body(body.data(), body.size(), ev);
+    log_parse("mouse padded", ok);
+    EXPECT_FALSE(ok);
 }
 
 TEST(InputEventParse, RejectsWrongLengthKeyboard) {
     auto body = pack_keyboard_input_event(InputEventType::KEY_DOWN,
                                           0x70, kTs);
     ParsedInputEvent ev;
-    EXPECT_FALSE(parse_input_event_body(body.data(), body.size() - 1, ev));
+    bool ok = parse_input_event_body(body.data(), body.size() - 1, ev);
+    log_parse("keyboard truncated", ok);
+    EXPECT_FALSE(ok);
     body.push_back(0u);
-    EXPECT_FALSE(parse_input_event_body(body.data(), body.size(), ev));
+    ok = parse_input_event_body(body.data(), body.size(), ev);
+    log_parse("keyboard padded", ok);
+    EXPECT_FALSE(ok);
 }
 
 TEST(InputEventParse, RejectsKeyCodeAbove255) {
@@ -88,14 +142,18 @@ TEST(InputEventParse, RejectsKeyCodeAbove255) {
     auto body = pack_keyboard_input_event(InputEventType::KEY_DOWN,
                                           0x0100 /* > 0xFF */, kTs);
     ParsedInputEvent ev;
-    EXPECT_FALSE(parse_input_event_body(body.data(), body.size(), ev));
+    bool ok = parse_input_event_body(body.data(), body.size(), ev);
+    log_parse("keyboard key code above 255", ok);
+    EXPECT_FALSE(ok);
 }
 
 TEST(InputEventParse, KeyDownF1MapsToGkcKeyboard) {
     auto body = pack_keyboard_input_event(InputEventType::KEY_DOWN,
                                           0x70 /* KB_F1 */, kTs);
     ParsedInputEvent ev;
-    ASSERT_TRUE(parse_input_event_body(body.data(), body.size(), ev));
+    bool ok = parse_input_event_body(body.data(), body.size(), ev);
+    log_parse("key down f1", ok);
+    ASSERT_TRUE(ok);
     EXPECT_EQ(ev.kind, ParsedInputEvent::Kind::Keyboard);
     EXPECT_EQ(ev.type, InputEventType::KEY_DOWN);
     EXPECT_EQ(ev.timestamp_us, kTs);
@@ -110,7 +168,9 @@ TEST(InputEventParse, KeyUpClearsDownFlag) {
     auto body = pack_keyboard_input_event(InputEventType::KEY_UP,
                                           0x25 /* KB_Left */, kTs);
     ParsedInputEvent ev;
-    ASSERT_TRUE(parse_input_event_body(body.data(), body.size(), ev));
+    bool ok = parse_input_event_body(body.data(), body.size(), ev);
+    log_parse("key up left", ok);
+    ASSERT_TRUE(ok);
     EXPECT_EQ(ev.keyboard.btDown, 0);
     EXPECT_EQ(ev.keyboard.btKey,  0x25);
 }
@@ -119,7 +179,9 @@ TEST(InputEventParse, LeftDownMapsToGkcMouse) {
     auto body = pack_mouse_input_event(InputEventType::MOUSE_LEFT_DOWN,
                                        9, 5, kTs);
     ParsedInputEvent ev;
-    ASSERT_TRUE(parse_input_event_body(body.data(), body.size(), ev));
+    bool ok = parse_input_event_body(body.data(), body.size(), ev);
+    log_parse("left mouse down", ok);
+    ASSERT_TRUE(ok);
     EXPECT_EQ(ev.kind, ParsedInputEvent::Kind::Mouse);
     EXPECT_EQ(ev.type, InputEventType::MOUSE_LEFT_DOWN);
     EXPECT_EQ(ev.mouse.uEvent,    static_cast<unsigned>(MOUSE_EVENT_DOWN));
@@ -133,7 +195,9 @@ TEST(InputEventParse, MouseMoveHasNoButton) {
     auto body = pack_mouse_input_event(InputEventType::MOUSE_MOVE,
                                        -3, 100, kTs);
     ParsedInputEvent ev;
-    ASSERT_TRUE(parse_input_event_body(body.data(), body.size(), ev));
+    bool ok = parse_input_event_body(body.data(), body.size(), ev);
+    log_parse("mouse move", ok);
+    ASSERT_TRUE(ok);
     EXPECT_EQ(ev.mouse.uEvent,   static_cast<unsigned>(MOUSE_EVENT_MOVE));
     EXPECT_EQ(ev.mouse.btButton, MOUSE_BUTTON_NONE);
     EXPECT_EQ(ev.mouse.x, -3);
@@ -144,7 +208,9 @@ TEST(InputEventParse, ScrollMapsToWheel) {
     auto body = pack_mouse_input_event(InputEventType::MOUSE_SCROLL,
                                        0, 0, kTs);
     ParsedInputEvent ev;
-    ASSERT_TRUE(parse_input_event_body(body.data(), body.size(), ev));
+    bool ok = parse_input_event_body(body.data(), body.size(), ev);
+    log_parse("mouse scroll", ok);
+    ASSERT_TRUE(ok);
     EXPECT_EQ(ev.mouse.uEvent,   static_cast<unsigned>(MOUSE_EVENT_WHEEL));
     EXPECT_EQ(ev.mouse.btButton, MOUSE_BUTTON_NONE);
     EXPECT_EQ(ev.mouse.btValue,  0);

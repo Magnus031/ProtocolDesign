@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <queue>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -125,6 +126,107 @@ const char* cmd_type_name(CmdType cmd) {
     case CmdType::ERROR_RESP:     return "ERROR_RESP";
     default:                      return "UNKNOWN";
     }
+}
+
+const char* key_name(uint8_t key) {
+    switch (key) {
+    case 0x08: return "BACKSPACE";
+    case 0x09: return "TAB";
+    case 0x0D: return "ENTER";
+    case 0x10: return "SHIFT";
+    case 0x11: return "CTRL";
+    case 0x12: return "ALT";
+    case 0x1B: return "ESC";
+    case 0x20: return "SPACE";
+    case 0x25: return "LEFT";
+    case 0x26: return "UP";
+    case 0x27: return "RIGHT";
+    case 0x28: return "DOWN";
+    case 0x70: return "F1";
+    case 0x71: return "F2";
+    case 0x72: return "F3";
+    case 0x73: return "F4";
+    case 0x74: return "F5";
+    case 0x75: return "F6";
+    case 0x76: return "F7";
+    case 0x77: return "F8";
+    case 0x78: return "F9";
+    case 0x79: return "F10";
+    case 0x7A: return "F11";
+    case 0x7B: return "F12";
+    default:   return nullptr;
+    }
+}
+
+uint16_t read_input_be16(const uint8_t* p) noexcept {
+    return (static_cast<uint16_t>(p[0]) << 8) |
+           static_cast<uint16_t>(p[1]);
+}
+
+uint32_t read_input_be32(const uint8_t* p) noexcept {
+    return (static_cast<uint32_t>(p[0]) << 24) |
+           (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8) |
+            static_cast<uint32_t>(p[3]);
+}
+
+uint64_t read_input_be64(const uint8_t* p) noexcept {
+    return (static_cast<uint64_t>(p[0]) << 56) |
+           (static_cast<uint64_t>(p[1]) << 48) |
+           (static_cast<uint64_t>(p[2]) << 40) |
+           (static_cast<uint64_t>(p[3]) << 32) |
+           (static_cast<uint64_t>(p[4]) << 24) |
+           (static_cast<uint64_t>(p[5]) << 16) |
+           (static_cast<uint64_t>(p[6]) << 8) |
+            static_cast<uint64_t>(p[7]);
+}
+
+std::string describe_input_event(const Packet& pkt) {
+    if (pkt.body.empty()) {
+        return "input=INVALID";
+    }
+
+    const uint8_t raw = pkt.body[0];
+    std::ostringstream os;
+    if (raw >= 0x01u && raw <= 0x06u) {
+        if (pkt.body.size() != 13u)
+            return "input=INVALID_MOUSE";
+        const char* action = "UNKNOWN";
+        switch (raw) {
+        case 0x01: action = "MOUSE_MOVE"; break;
+        case 0x02: action = "MOUSE_LEFT_DOWN"; break;
+        case 0x03: action = "MOUSE_LEFT_UP"; break;
+        case 0x04: action = "MOUSE_RIGHT_DOWN"; break;
+        case 0x05: action = "MOUSE_RIGHT_UP"; break;
+        case 0x06: action = "MOUSE_SCROLL"; break;
+        default: break;
+        }
+        const int32_t x = static_cast<int32_t>(read_input_be32(pkt.body.data() + 1));
+        const int32_t y = static_cast<int32_t>(read_input_be32(pkt.body.data() + 5));
+        const uint64_t ts = read_input_be64(pkt.body.data() + 9);
+        os << "input=" << action << " x=" << x << " y=" << y << " ts=" << ts;
+        return os.str();
+    }
+
+    if (raw == 0x10u || raw == 0x11u) {
+        if (pkt.body.size() != 11u)
+            return "input=INVALID_KEYBOARD";
+        const uint16_t key_code = read_input_be16(pkt.body.data() + 1);
+        const uint64_t ts = read_input_be64(pkt.body.data() + 3);
+        os << "input=" << (raw == 0x10u ? "KEY_DOWN" : "KEY_UP");
+        os << " key=";
+        const uint8_t key = static_cast<uint8_t>(key_code & 0xFFu);
+        const char* name = key_name(key);
+        if (name != nullptr && key_code <= 0xFFu) {
+            os << name;
+        } else {
+            os << "0x" << std::hex << static_cast<unsigned>(key_code) << std::dec;
+        }
+        os << " state=" << (raw == 0x10u ? "DOWN" : "UP") << " ts=" << ts;
+        return os.str();
+    }
+
+    return "input=UNKNOWN";
 }
 
 } // namespace
@@ -271,6 +373,7 @@ struct Gateway::Impl {
             sessions_.remove_by_client(conn->id_);
         }
 
+        wait_for_drain_workers();
         call_destructor(*conn);
         while (atomic_compare_exchange((int&)client_lock_, 0, 1)) {}
         client_pool_.PutFreeNode(conn);
@@ -305,6 +408,7 @@ struct Gateway::Impl {
             sessions_.remove_by_apphost(conn->id_);
         }
 
+        wait_for_drain_workers();
         call_destructor(*conn);
         while (atomic_compare_exchange((int&)apphost_lock_, 0, 1)) {}
         apphost_pool_.PutFreeNode(conn);
@@ -555,12 +659,23 @@ struct Gateway::Impl {
         conn->parser_.feed(data, len);
         Packet pkt;
         while (conn->parser_.next_packet(pkt) == ParseResult::OK) {
-            std::fprintf(stderr,
-                         "[gateway] recv from client  id=%lu cmd=%s session=%u body=%u\n",
-                         static_cast<unsigned long>(conn->id_),
-                         cmd_type_name(pkt.header.cmd_type),
-                         static_cast<unsigned>(pkt.header.session_id),
-                         static_cast<unsigned>(pkt.header.body_length));
+            if (pkt.header.cmd_type == CmdType::INPUT_EVENT) {
+                const std::string input = describe_input_event(pkt);
+                std::fprintf(stderr,
+                             "[gateway] recv from client  id=%lu cmd=%s session=%u body=%u %s\n",
+                             static_cast<unsigned long>(conn->id_),
+                             cmd_type_name(pkt.header.cmd_type),
+                             static_cast<unsigned>(pkt.header.session_id),
+                             static_cast<unsigned>(pkt.header.body_length),
+                             input.c_str());
+            } else {
+                std::fprintf(stderr,
+                             "[gateway] recv from client  id=%lu cmd=%s session=%u body=%u\n",
+                             static_cast<unsigned long>(conn->id_),
+                             cmd_type_name(pkt.header.cmd_type),
+                             static_cast<unsigned>(pkt.header.session_id),
+                             static_cast<unsigned>(pkt.header.body_length));
+            }
 
             if (conn->session_id_ != 0)
                 sessions_.mark_client_seen(conn->session_id_, GatewayClock::now());
@@ -823,6 +938,10 @@ struct Gateway::Impl {
                         std::chrono::milliseconds(config_.client_timeout_ms)) {
                         // The client side is presumed gone or unresponsive. Do
                         // not send ERROR_RESP to the peer that already timed out.
+                        std::fprintf(stderr,
+                                     "[gateway] client timeout  session=%u timeout_ms=%d\n",
+                                     static_cast<unsigned>(snap.session_id),
+                                     config_.client_timeout_ms);
                         fail_session(snap.session_id, false);
                         continue;
                     }
@@ -831,6 +950,10 @@ struct Gateway::Impl {
                         // The AppHost process/socket may still exist, but the
                         // protocol side is stale; notify the client of backend
                         // failure before tearing down the session.
+                        std::fprintf(stderr,
+                                     "[gateway] apphost timeout  session=%u timeout_ms=%d\n",
+                                     static_cast<unsigned>(snap.session_id),
+                                     config_.apphost_timeout_ms);
                         fail_session(snap.session_id, true);
                         continue;
                     }
@@ -913,6 +1036,15 @@ struct Gateway::Impl {
             });
         }
         cv_.notify_all();
+    }
+
+    void wait_for_drain_workers() noexcept {
+        if (drain_workers_.load(std::memory_order_acquire) == 0)
+            return;
+        std::unique_lock<std::mutex> lk(wait_mtx_);
+        cv_.wait(lk, [this] {
+            return drain_workers_.load(std::memory_order_acquire) == 0;
+        });
     }
 
     void wait() {

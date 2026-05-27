@@ -1,8 +1,33 @@
 #include "src/common/byte_order.h"
+#include <cstdlib>
+#include <iostream>
 #include <gtest/gtest.h>
+
+namespace {
+
+bool test_log_enabled() {
+    return std::getenv("PD_TEST_LOG") != nullptr;
+}
+
+template <typename T>
+void log_bytes(const char* name, T value) {
+    if (!test_log_enabled()) {
+        return;
+    }
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&value);
+    std::cout << "[byte-order-test] " << name << " bytes=";
+    for (size_t i = 0; i < sizeof(T); ++i) {
+        std::cout << (i == 0 ? "" : " ") << "0x"
+                  << std::hex << static_cast<int>(bytes[i]);
+    }
+    std::cout << std::dec << '\n';
+}
+
+}  // namespace
 
 TEST(BE16Test, KnownValue) {
     uint16_t val = BE16(0x1234);
+    log_bytes("BE16 0x1234", val);
     const uint8_t* b = reinterpret_cast<const uint8_t*>(&val);
     EXPECT_EQ(b[0], 0x12);
     EXPECT_EQ(b[1], 0x34);
@@ -10,6 +35,7 @@ TEST(BE16Test, KnownValue) {
 
 TEST(BE32Test, KnownValue) {
     uint32_t val = BE32(0x12345678);
+    log_bytes("BE32 0x12345678", val);
     const uint8_t* b = reinterpret_cast<const uint8_t*>(&val);
     EXPECT_EQ(b[0], 0x12);
     EXPECT_EQ(b[1], 0x34);
@@ -45,6 +71,7 @@ TEST(LE32Test, KnownValue) {
 
 TEST(BE64Test, KnownValue) {
     uint64_t val = BE64(0x0102030405060708ull);
+    log_bytes("BE64 0x0102030405060708", val);
     const uint8_t* b = reinterpret_cast<const uint8_t*>(&val);
     EXPECT_EQ(b[0], 0x01);
     EXPECT_EQ(b[1], 0x02);

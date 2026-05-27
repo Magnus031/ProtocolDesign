@@ -21,6 +21,14 @@ static uint16_t parse_port_arg(const char* value) {
     return static_cast<uint16_t>(v);
 }
 
+static int parse_positive_int_arg(const char* value) {
+    char* end = nullptr;
+    long v = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || v <= 0 || v > 24L * 60L * 60L * 1000L)
+        return 0;
+    return static_cast<int>(v);
+}
+
 int main(int argc, char* argv[]) {
     Gateway::Config config{};
 
@@ -39,6 +47,14 @@ int main(int argc, char* argv[]) {
         } else if (std::strcmp(argv[i], "--apphost-bin") == 0 && i + 1 < argc) {
             config.apphost_bin = argv[++i];
             config.auto_spawn_apphost = true;
+        } else if (std::strncmp(argv[i], "--client-timeout-ms=", 20) == 0) {
+            config.client_timeout_ms = parse_positive_int_arg(argv[i] + 20);
+        } else if (std::strcmp(argv[i], "--client-timeout-ms") == 0 && i + 1 < argc) {
+            config.client_timeout_ms = parse_positive_int_arg(argv[++i]);
+        } else if (std::strncmp(argv[i], "--apphost-timeout-ms=", 21) == 0) {
+            config.apphost_timeout_ms = parse_positive_int_arg(argv[i] + 21);
+        } else if (std::strcmp(argv[i], "--apphost-timeout-ms") == 0 && i + 1 < argc) {
+            config.apphost_timeout_ms = parse_positive_int_arg(argv[++i]);
         } else if (std::strncmp(argv[i], "--app=", 6) == 0) {
             std::string spec = argv[i] + 6;
             const size_t eq = spec.find('=');
@@ -53,16 +69,19 @@ int main(int argc, char* argv[]) {
             std::fprintf(stderr,
                          "Usage: gateway [--public-port <1-65535>] "
                          "[--apphost-internal-port <1-65535>] "
-                         "[--apphost-bin <path>] [--app=name=plugin_path]\n");
+                         "[--apphost-bin <path>] [--app=name=plugin_path] "
+                         "[--client-timeout-ms <ms>] [--apphost-timeout-ms <ms>]\n");
             return 1;
         }
     }
 
-    if (config.public_port == 0 || config.apphost_internal_port == 0) {
+    if (config.public_port == 0 || config.apphost_internal_port == 0 ||
+        config.client_timeout_ms == 0 || config.apphost_timeout_ms == 0) {
         std::fprintf(stderr,
                      "Usage: gateway [--public-port <1-65535>] "
                      "[--apphost-internal-port <1-65535>] "
-                     "[--apphost-bin <path>] [--app=name=plugin_path]\n");
+                     "[--apphost-bin <path>] [--app=name=plugin_path] "
+                     "[--client-timeout-ms <ms>] [--apphost-timeout-ms <ms>]\n");
         return 1;
     }
 
@@ -81,8 +100,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::fprintf(stdout, "Gateway: public=%u apphost_internal=%u\n",
-                 config.public_port, config.apphost_internal_port);
+    std::fprintf(stdout,
+                 "Gateway: public=%u apphost_internal=%u client_timeout_ms=%d apphost_timeout_ms=%d\n",
+                 config.public_port, config.apphost_internal_port,
+                 config.client_timeout_ms, config.apphost_timeout_ms);
     gateway.wait();
     return 0;
 }

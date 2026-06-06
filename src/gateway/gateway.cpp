@@ -35,6 +35,19 @@ namespace {
 // peer's MessageParser.
 constexpr size_t kIoPoolMaxChunk = 4000;
 
+// ── TEMP PERF DIAGNOSTIC ────────────────────────────────────────────────────
+// Inline timestamp logging used to attribute the ~40 ms unaccounted-for
+// portion of end-to-end latency.  Activated only when the GATEWAY_PERF_TRACE
+// environment variable is set.  Remove this block once the analysis is done.
+static const bool g_perf_trace = std::getenv("GATEWAY_PERF_TRACE") != nullptr;
+static const auto g_perf_t0    = std::chrono::steady_clock::now();
+static long long perf_now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - g_perf_t0).count();
+}
+#define PERF_LOG(...) do { if (g_perf_trace) std::fprintf(stderr, __VA_ARGS__); } while (0)
+// ────────────────────────────────────────────────────────────────────────────
+
 void push_chunked(std::queue<std::vector<uint8_t>>& q,
                   std::vector<uint8_t> data) {
     if (data.empty()) return;
@@ -522,6 +535,8 @@ struct Gateway::Impl {
             std::memcpy(raw, chunk.data(), chunk.size());
             conn->send_queue_.pop();
             pool_.GetFunc()->EndInput(pool_.GetContext(), conn->id_);
+            PERF_LOG("[perf] +%lld us  enqueue_client EAGER chunk size=%zu queue_left=%zu\n",
+                     perf_now_us(), chunk.size(), conn->send_queue_.size());
         }
         atomic_compare_exchange((int&)client_lock_, 1, 0);
     }
@@ -572,9 +587,17 @@ struct Gateway::Impl {
     }
 
     void schedule_client_drain(ClientSession* conn, uint64_t generation) {
+        PERF_LOG("[perf] +%lld us  schedule_client_drain CALLED (queue spawning thread)\n",
+                 perf_now_us());
         drain_workers_.fetch_add(1, std::memory_order_acq_rel);
         std::thread([this, conn, generation] {
+            const long long t_thread_start = perf_now_us();
+            PERF_LOG("[perf] +%lld us  client drain thread STARTED (about to sleep_for 1ms)\n",
+                     t_thread_start);
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            const long long t_sleep_end = perf_now_us();
+            PERF_LOG("[perf] +%lld us  client drain thread WAKE (slept actual=%lld us)\n",
+                     t_sleep_end, t_sleep_end - t_thread_start);
             drain_client_queue(conn, generation);
             if (drain_workers_.fetch_sub(1, std::memory_order_acq_rel) == 1)
                 cv_.notify_all();
@@ -609,6 +632,8 @@ struct Gateway::Impl {
             conn->send_queue_.pop();
             // notify socket sends to the client
             pool_.GetFunc()->EndInput(pool_.GetContext(), conn->id_);
+            PERF_LOG("[perf] +%lld us  drain_client_queue SENT chunk size=%zu queue_left=%zu\n",
+                     perf_now_us(), data.size(), conn->send_queue_.size());
             atomic_compare_exchange((int&)client_lock_, 1, 0);
             return;
         }
@@ -644,6 +669,8 @@ struct Gateway::Impl {
     }
 
     void on_client_sent(ClientSession* conn) {
+        PERF_LOG("[perf] +%lld us  on_client_sent CALLBACK (IoPool finished prior chunk)\n",
+                 perf_now_us());
         const uint64_t generation = client_generation(conn);
         if (generation != 0)
             schedule_client_drain(conn, generation);
@@ -656,6 +683,8 @@ struct Gateway::Impl {
     }
 
     void on_client_received(ClientSession* conn, const uint8_t* data, size_t len) {
+        PERF_LOG("[perf] +%lld us  on_client_received bytes=%zu\n",
+                 perf_now_us(), len);
         conn->parser_.feed(data, len);
         Packet pkt;
         while (conn->parser_.next_packet(pkt) == ParseResult::OK) {
@@ -704,6 +733,8 @@ struct Gateway::Impl {
     }
 
     void on_apphost_received(AppHostSession* conn, const uint8_t* data, size_t len) {
+        PERF_LOG("[perf] +%lld us  on_apphost_received bytes=%zu\n",
+                 perf_now_us(), len);
         conn->parser_.feed(data, len);
         Packet pkt;
         while (conn->parser_.next_packet(pkt) == ParseResult::OK) {
@@ -838,6 +869,10 @@ struct Gateway::Impl {
     void forward_to_client(const Packet& pkt) {
         const uintptr target = sessions_.find_client(pkt.header.session_id);
         if (target != 0) {
+            PERF_LOG("[perf] +%lld us  forward_to_client ENTRY cmd=%s body=%u\n",
+                     perf_now_us(),
+                     cmd_type_name(pkt.header.cmd_type),
+                     static_cast<unsigned>(pkt.header.body_length));
             send_to_client(target, serialize_packet(pkt));
         } else {
             std::fprintf(stderr,

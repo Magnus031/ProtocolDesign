@@ -33,3 +33,13 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_binary(
+    name = "message_parser_bench",
+    srcs = ["message_parser_bench.cpp"],
+    deps = [
+        ":message_parser",
+        ":protocol",
+    ],
+    visibility = ["//visibility:public"],
+)

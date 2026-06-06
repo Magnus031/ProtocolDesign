@@ -22,6 +22,16 @@ cc_test(
     copts = ["-std=c++17"],
 )
 
+cc_binary(
+    name = "pixel_capture_bench",
+    srcs = ["pixel_capture_bench.cpp"],
+    deps = [
+        ":pixel_capture",
+    ],
+    copts = ["-std=c++17"],
+    visibility = ["//visibility:public"],
+)
+
 # Headless fake IUiHost.  Hosts (apphost_bin) link this; plugins do NOT.
 cc_library(
     name = "ui_host_impl",

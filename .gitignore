@@ -15,6 +15,8 @@
 # Generated documentation
 /docs/html/
 
+/docs/perf-logs/
+
 # Local third-party build outputs
 /third_party/GKC/build/
 /third_party/GKC_BUILD/

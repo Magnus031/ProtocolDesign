@@ -37,6 +37,27 @@ cc_binary(
     copts = ["-std=c++17"],
 )
 
+cc_binary(
+    name = "gateway_forward_bench",
+    srcs = ["gateway_forward_bench.cpp"],
+    deps = ["//src/protocol:protocol"],
+    copts = ["-std=c++17"],
+    visibility = ["//visibility:public"],
+)
+
+cc_binary(
+    name = "fake_e2e_client_bench",
+    srcs = ["fake_e2e_client_bench.cpp"],
+    deps = [
+        ":gateway",
+        "//src/common:input_event",
+        "//src/protocol:message_parser",
+        "//src/protocol:protocol",
+    ],
+    copts = ["-std=c++17"],
+    visibility = ["//visibility:public"],
+)
+
 cc_test(
     name = "gateway_test",
     srcs = ["gateway_test.cpp"],

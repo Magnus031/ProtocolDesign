@@ -13,9 +13,12 @@
 /.vscode/
 
 # Generated documentation
-/docs/html/
+# /docs/html/
 
-/docs/perf-logs/
+# /docs/perf-logs/
+/docs
+
+CLAUDE.md
 
 # Local third-party build outputs
 /third_party/GKC/build/
